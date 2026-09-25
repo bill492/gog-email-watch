@@ -1,0 +1,33 @@
+{
+  "id": "gog-email-watch",
+  "name": "Gog Email Watch",
+  "version": "0.1.0",
+  "description": "Poll Gmail through the existing gog CLI and dispatch approved mail to an OpenClaw agent.",
+  "activation": { "onStartup": true },
+  "contracts": { "tools": ["gog_email_reply", "gog_email_skip"] },
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "required": ["account"],
+    "properties": {
+      "account": { "type": "string", "minLength": 1 },
+      "domains": { "type": "array", "items": { "type": "string" }, "default": [] },
+      "senders": { "type": "array", "items": { "type": "string" }, "default": [] },
+      "agentId": { "type": "string", "default": "main", "minLength": 1 },
+      "pollIntervalSeconds": { "type": "integer", "minimum": 1, "default": 120 },
+      "gogPath": { "type": "string", "default": "gog", "minLength": 1 },
+      "selfAddresses": { "type": "array", "items": { "type": "string" }, "default": [] }
+    },
+    "anyOf": [
+      { "required": ["domains"], "properties": { "domains": { "minItems": 1 } } },
+      { "required": ["senders"], "properties": { "senders": { "minItems": 1 } } }
+    ]
+  },
+  "uiHints": {
+    "account": { "label": "Gmail account", "help": "An account already authenticated in this node's gog CLI." },
+    "domains": { "label": "Sender domains", "help": "Exact domains; subdomains are not implicitly included." },
+    "senders": { "label": "Individual senders" },
+    "gogPath": { "label": "gog executable", "advanced": true },
+    "selfAddresses": { "label": "Additional self aliases", "advanced": true }
+  }
+}

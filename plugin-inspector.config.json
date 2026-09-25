@@ -1,0 +1,13 @@
+{
+  "version": 1,
+  "plugin": {
+    "id": "gog-email-watch",
+    "priority": "high",
+    "seams": ["plugin-runtime"],
+    "sourceRoot": ".",
+    "expect": {
+      "registrations": ["registerService", "registerTool", "registerCommand"]
+    }
+  },
+  "capture": { "mockSdk": true }
+}

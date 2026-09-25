@@ -1,0 +1,75 @@
+{
+  "name": "@unblocklabs/gog-email-watch",
+  "version": "0.1.0",
+  "license": "MIT",
+  "description": "An OpenClaw plugin that watches Gmail through the node's existing gog CLI and wakes its agent for approved senders.",
+  "type": "module",
+  "main": "./dist/index.js",
+  "publishConfig": { "access": "public" },
+  "engines": {
+    "node": ">=22.22.3 <23 || >=24.15.0 <25 || >=25.9.0"
+  },
+  "files": [
+    "dist",
+    "openclaw.plugin.json",
+    "README.md"
+  ],
+  "openclaw": {
+    "install": {
+      "npmSpec": "@unblocklabs/gog-email-watch",
+      "defaultChoice": "npm",
+      "minHostVersion": ">=2026.9.2"
+    },
+    "extensions": [
+      "./dist/index.js"
+    ],
+    "compat": {
+      "pluginApi": ">=2026.9.2"
+    },
+    "build": {
+      "openclawVersion": "2026.9.2",
+      "pluginSdkVersion": "2026.9.2"
+    },
+    "release": {
+      "publishToNpm": true,
+      "publishToClawHub": false
+    }
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "prepack": "npm run build",
+    "release:check": "node scripts/check-release-version.mjs",
+    "check": "tsc --noEmit",
+    "test": "node --import tsx --test test/*.test.ts",
+    "plugin:inspect": "plugin-inspector check --config plugin-inspector.config.json --no-openclaw",
+    "plugin:inspect:runtime": "plugin-inspector capture dist/index.js --real-sdk --allow-execute --plugin-root . --output reports/runtime-capture.json",
+    "preflight": "npm run check && npm run build && npm test && npm run plugin:inspect && npm run plugin:inspect:runtime && npm pack --dry-run --ignore-scripts"
+  },
+  "dependencies": {
+    "@sinclair/typebox": "^0.34.41",
+    "email-addresses": "^5.0.0"
+  },
+  "peerDependencies": {
+    "openclaw": ">=2026.9.2"
+  },
+  "peerDependenciesMeta": {
+    "openclaw": {
+      "optional": true
+    }
+  },
+  "devDependencies": {
+    "@openclaw/plugin-inspector": "0.3.26",
+    "@types/node": "^22.19.0",
+    "openclaw": "2026.9.2",
+    "tsx": "^4.20.6",
+    "typescript": "^5.9.3"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/unblocklabs-ai/gog-email-watch.git"
+  },
+  "homepage": "https://github.com/unblocklabs-ai/gog-email-watch#readme",
+  "bugs": {
+    "url": "https://github.com/unblocklabs-ai/gog-email-watch/issues"
+  }
+}

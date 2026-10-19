@@ -38,7 +38,7 @@ export class MailState {
   readonly db: DatabaseSync;
 
   constructor(stateDir: string) {
-    mkdirSync(stateDir, { recursive: true, mode: 0o700 });
+    mkdirSync(stateDir, { recursive: true });
     this.db = new DatabaseSync(join(stateDir, "mail.sqlite"));
     this.db.exec(`
       PRAGMA journal_mode=WAL;

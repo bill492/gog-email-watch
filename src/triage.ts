@@ -58,7 +58,7 @@ export function createTriage(options: {
   async function assess(thread: GmailThread, target: GmailMessage, historical = false) {
     const current = policy();
     const source = evidence(thread);
-    const facts = mailFacts(target, config);
+    const facts = mailFacts(target, config, thread);
     const key = cacheKey(source.hash, target.id, current.document);
     let outcome: DecisionOutcome | undefined;
     const excluded = envelope.excludedSenders.includes(facts.sender) || envelope.excludedDomains.includes(facts.domain);
@@ -150,10 +150,13 @@ export function createTriage(options: {
     const candidate = parsePolicy(document, envelope);
     const rows = state.db.prepare("SELECT * FROM triage ORDER BY updated DESC,id LIMIT ?").all(limit) as unknown as TriageRecord[];
     return rows.map(row => {
+      const facts = JSON.parse(row.facts) as Facts;
+      if (facts.conversationReply === undefined && candidate.rules.some(rule => rule.all.some(test => "fact" in test && test.fact === "conversationReply")))
+        return { id: row.id, before: JSON.parse(row.plan) as Plan, assessment: "fresh thread facts required; rescan or reevaluate" };
       const key = cacheKey(row.evidence_hash, row.id, candidate);
       const cached = state.db.prepare("SELECT outcome FROM assessments WHERE key=?").get(key) as { outcome: string } | undefined;
       const outcome = cached ? JSON.parse(cached.outcome) as DecisionOutcome : undefined;
-      const plan = evaluatePolicy(candidate, envelope, JSON.parse(row.facts) as Facts, outcome?.status === "ok" ? outcome.result.answers : undefined, (JSON.parse(row.coverage) as { complete: boolean }).complete);
+      const plan = evaluatePolicy(candidate, envelope, facts, outcome?.status === "ok" ? outcome.result.answers : undefined, (JSON.parse(row.coverage) as { complete: boolean }).complete);
       return { id: row.id, before: JSON.parse(row.plan) as Plan, after: plan, assessment: cached ? "cached" : "new evaluation required" };
     });
   }

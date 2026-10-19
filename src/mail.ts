@@ -52,6 +52,7 @@ export interface ActivationCutoffs {
   activeSince: number;
   domainSince?: Record<string, number>;
   senderSince?: Record<string, number>;
+  conversationSince?: number;
 }
 
 export interface Eligibility {
@@ -135,14 +136,20 @@ function first(headers: Map<string, string[]>, name: string): string {
   return headers.get(name)?.[0] ?? "";
 }
 
-export function mailFacts(message: GmailMessage, config: MailConfig): Facts {
+function conversationReply(message: GmailMessage, config: MailConfig, thread?: GmailThread): boolean {
+  return !config.selfAddresses.includes(senderAddress(message)) && !!thread?.messages.some(prior =>
+    prior.labelIds.includes("SENT") && config.selfAddresses.includes(senderAddress(prior)) &&
+    Number(prior.internalDate) < Number(message.internalDate));
+}
+
+export function mailFacts(message: GmailMessage, config: MailConfig, thread?: GmailThread): Facts {
   const sender = senderAddress(message), domain = sender.split("@")[1] ?? "";
   const h = headers(message);
   const auth = first(h, "authentication-results").toLowerCase();
   const escaped = domain.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
   const authenticated = !!domain && /^\s*mx\.google\.com\s*;/.test(auth) && new RegExp(`\\bdmarc=pass\\b[^;]*\\bheader\\.from=${escaped}(?=[\\s;]|$)`).test(auth);
   const automated = !["", "no"].includes(first(h, "auto-submitted").toLowerCase()) || ["bulk", "list", "junk"].includes(first(h, "precedence").toLowerCase()) || h.has("list-id") || automatedLocals.has(sender.split("@")[0]);
-  return { sender, domain, authenticated, automated, approved: !!sender && authenticated && !automated && !config.selfAddresses.includes(sender) && (config.domains.includes(domain) || config.senders.includes(sender)), labels: message.labelIds };
+  return { sender, domain, authenticated, automated, conversationReply: conversationReply(message, config, thread), approved: !!sender && authenticated && !automated && !config.selfAddresses.includes(sender) && (config.domains.includes(domain) || config.senders.includes(sender)), labels: message.labelIds };
 }
 
 export function sendReceipt(value: unknown, threadId: string): { messageId: string; threadId: string } {
@@ -157,11 +164,14 @@ export function senderAddress(message: GmailMessage): string {
   try { return address(values[0]); } catch { return ""; }
 }
 
-export function eligibility(message: GmailMessage, config: MailConfig, cutoffs: ActivationCutoffs): Eligibility {
+// Passing thread evidence permits the configured conversation wake exception.
+// Send authorization intentionally calls this without that evidence.
+export function eligibility(message: GmailMessage, config: MailConfig, cutoffs: ActivationCutoffs, thread?: GmailThread): Eligibility {
   const h = headers(message);
   const sender = senderAddress(message);
   const domain = sender.split("@")[1] ?? "";
-  if (!sender || (!config.domains.includes(domain) && !config.senders.includes(sender))) {
+  const externalReply = config.triage?.wakeOnExternalReplies && cutoffs.conversationSince !== undefined && conversationReply(message, config, thread);
+  if (!sender || (!config.domains.includes(domain) && !config.senders.includes(sender) && !externalReply)) {
     return { accepted: false, reason: "external-or-invalid-sender", sender };
   }
   if (config.selfAddresses.includes(sender)) return { accepted: false, reason: "self", sender };
@@ -171,6 +181,7 @@ export function eligibility(message: GmailMessage, config: MailConfig, cutoffs: 
   const permittedSince = [
     ...(config.domains.includes(domain) ? [cutoffs.domainSince?.[domain] ?? cutoffs.activeSince] : []),
     ...(config.senders.includes(sender) ? [cutoffs.senderSince?.[sender] ?? cutoffs.activeSince] : []),
+    ...(externalReply ? [cutoffs.conversationSince!] : []),
   ];
   const cutoff = Math.max(cutoffs.activeSince, Math.min(...permittedSince));
   if (Number(message.internalDate) < cutoff * 1000) return { accepted: false, reason: "before-activation", sender };
@@ -187,7 +198,7 @@ export function eligibility(message: GmailMessage, config: MailConfig, cutoffs: 
   const passed = new RegExp(`\\bdmarc=pass\\b[^;]*\\bheader\\.from=${escapedDomain}(?=[\\s;]|$)`);
   if (!/^\s*mx\.google\.com\s*;/.test(auth)) return { accepted: false, reason: "missing-google-authentication", sender };
   if (!passed.test(auth)) return { accepted: false, reason: "sender-authentication-not-passed", sender };
-  return { accepted: true, reason: "internal", sender };
+  return { accepted: true, reason: externalReply && !config.domains.includes(domain) && !config.senders.includes(sender) ? "external-conversation-reply" : "internal", sender };
 }
 
 function parseVisibleAddresses(values: readonly string[]): string[] {
@@ -331,7 +342,7 @@ export class GogMailClient {
     catch { throw new Error("gog returned invalid JSON"); }
   }
 
-  async searchPage(afterSeconds: number, page?: string, scope: "approved" | "inbox" = this.config.triage?.observe ?? "approved"): Promise<{ messages: SearchMessage[]; nextPageToken?: string }> {
+  async searchPage(afterSeconds: number, page?: string, scope: "approved" | "inbox" = this.config.triage?.wakeOnExternalReplies ? "inbox" : this.config.triage?.observe ?? "approved"): Promise<{ messages: SearchMessage[]; nextPageToken?: string }> {
     if (!Number.isInteger(afterSeconds) || afterSeconds < 0) throw new Error("invalid search cutoff");
     const senders = [
       ...this.config.domains.map((domain) => `from:(@${domain})`),
@@ -413,7 +424,7 @@ export class GogMailClient {
     const folder = await mkdtemp(join(tmpdir(), "gog-email-watch-"));
     const bodyPath = join(folder, "body.html");
     try {
-      await writeFile(bodyPath, plainTextToHtml(request.body), { mode: 0o600 });
+      await writeFile(bodyPath, plainTextToHtml(request.body));
       const args = ["gmail", "send", "--to", request.to.join(","), "--reply-to-message-id", request.targetMessageId,
         "--body-html-file", bodyPath, "--signature"];
       if (request.cc.length) args.push("--cc", request.cc.join(","));

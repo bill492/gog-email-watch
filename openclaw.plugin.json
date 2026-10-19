@@ -1,7 +1,7 @@
 {
   "id": "gog-email-watch",
   "name": "Gog Email Watch",
-  "version": "0.2.1",
+  "version": "0.2.2",
   "description": "Policy-based inbox triage with review-only maintenance and approved-sender agent workflows.",
   "activation": {
     "onStartup": true
@@ -107,6 +107,10 @@
               }
             ]
           },
+          "wakeOnExternalReplies": {
+            "description": "Allow authenticated human replies in threads with an earlier Sent message from this account to wake the agent. Does not grant reply/send authority. Default false.",
+            "type": "boolean"
+          },
           "decisionModel": {
             "minLength": 1,
             "maxLength": 2000,
@@ -171,6 +175,7 @@
           "policyEditors": {
             "maxItems": 64,
             "uniqueItems": true,
+            "description": "Deprecated and ignored. Agents with policy/review tools can use them without an editor allowlist.",
             "type": "array",
             "items": {
               "minLength": 1,
@@ -389,6 +394,10 @@
                                   {
                                     "const": "automated",
                                     "type": "string"
+                                  },
+                                  {
+                                    "const": "conversationReply",
+                                    "type": "string"
                                   }
                                 ]
                               },
@@ -592,6 +601,7 @@
               "digestMinutes": {
                 "minimum": 5,
                 "maximum": 10080,
+                "description": "Minimum minutes between digest agent runs per destination. First batch waits this long; empty inboxes never wake the agent.",
                 "type": "integer"
               },
               "quietHours": {

@@ -168,6 +168,41 @@ test('registered service honors the canonical per-agent decision model before in
   } finally { await service.stop?.(context); }
 }));
 
+test('policy tools support ordinary and delegated agents without owner context while retaining version checks', async () => withHarness(async (h) => {
+  let service: Parameters<OpenClawPluginApi['registerService']>[0] | undefined;
+  let factory: Parameters<OpenClawPluginApi['registerTool']>[0] | undefined;
+  const api = {
+    pluginConfig: triageConfig(h.config),
+    runtime: { config: { current: () => ({}) }, subagent: {} },
+    registerService(value: Parameters<OpenClawPluginApi['registerService']>[0]) { service = value; },
+    registerTool(value: Parameters<OpenClawPluginApi['registerTool']>[0]) { factory = value; },
+    registerCommand() {}, registerGatewayMethod() {}, registerCli() {},
+  } as unknown as OpenClawPluginApi;
+  plugin.register(api);
+  assert.ok(service); assert.equal(typeof factory, 'function');
+  if (typeof factory !== 'function') throw new Error('tool factory missing');
+  const context = { config: {}, stateDir: h.stateDir, logger: { info() {}, warn() {}, error() {}, debug() {} } };
+  h.setFixture({ ...fixture([]), probeWritableDb: false });
+  try {
+    await service.start(context);
+    let version = 1;
+    for (const sessionKey of ['agent:main:main', 'agent:helper:subagent:child', 'agent:main:gog-email-watch:agent@example.com:bb01']) {
+      const agentTools = factory({ agentId: 'helper', sessionKey, senderIsOwner: false });
+      assert.ok(Array.isArray(agentTools));
+      const update = agentTools.find(tool => tool.name === 'gog_email_policy_update')!;
+      const policy = { ...structuredClone(defaultPolicy), digestMinutes: 60, interests: `Updated by ${sessionKey}` };
+      await update.execute('edit', { policy, expectedVersion: version });
+      // Reusing the prior version would conceal a failed/no-op update.
+      await assert.rejects(update.execute('stale', { policy, expectedVersion: version }), /version/);
+      version++;
+      const saved = await agentTools.find(tool => tool.name === 'gog_email_policy_get')!.execute('read', {});
+      assert.ok(saved.details && typeof saved.details === 'object' && 'document' in saved.details);
+      assert.deepEqual(saved.details.document, policy);
+      await assert.rejects(update.execute('too-frequent', { policy: { ...policy, digestMinutes: 1 }, expectedVersion: version }), /invalid policy/);
+    }
+  } finally { await service.stop?.(context); }
+}));
+
 test('an unreadable thread does not discard healthy discoveries or block their dispatch', async () => withHarness(async (h) => {
   h.setFixture(fixture([]));
   let workflow: ReturnType<typeof createMailWorkflow>;
@@ -465,7 +500,7 @@ test('shadow assessments are durable, threshold previews reuse them, and questio
     policy.rules[0].all[1] = { question: 'actionable', atLeast: 1 };
     const preview = workflow.policyPreview(policy);
     assert.equal(preview[0].before.attention, 'wake');
-    assert.equal(preview[0].after.attention, 'digest');
+    assert.equal(preview[0].after?.attention, 'digest');
     assert.equal(provider.calls(), 1);
     workflow.policyUpdate(policy, 1, 'owner');
     assert.throws(() => workflow.policyUpdate(policy, 1, 'owner'), /version/);
@@ -473,6 +508,9 @@ test('shadow assessments are durable, threshold previews reuse them, and questio
     assert.equal(workflow.policyPreview(policy)[0].assessment, 'new evaluation required');
     await workflow.poll();
     assert.equal(provider.calls(), 1);
+    // Persisted pre-upgrade facts cannot answer the new conversation condition.
+    const db = h.db(); db.prepare("UPDATE triage SET facts=json_remove(facts,'$.conversationReply')").run(); db.close();
+    assert.match(workflow.policyPreview(policy)[0].assessment, /fresh thread facts required/);
   } finally { await workflow.stop(); }
 }));
 
@@ -607,7 +645,7 @@ test('persisted page progress drains beyond the poll bound without losing discov
   } finally { await workflow.stop(); }
 }));
 
-test('deferred work resumes once with fresh checks and digest completion survives restart', async () => withHarness(async (h) => {
+test('deferred work resumes once with fresh checks', async () => withHarness(async (h) => {
   h.setFixture(fixture([]));
   const provider = assessments();
   const config = triageConfig(h.config, { mode: 'live', actions: ['wake', 'digest'] });
@@ -629,15 +667,144 @@ test('deferred work resumes once with fresh checks and digest completion survive
     const db = h.db(); db.prepare("UPDATE messages SET due=0 WHERE status='deferred'").run(); db.close();
     await workflow.poll(); await waitFor(() => !workflow.status().working);
     assert.equal(runs, 2); assert.equal(workflow.status().jobs.completed, 1);
+  } finally { await workflow.stop(); }
+}));
+
+test('new human replies in participated conversations wake without an actionable request', async () => withHarness(async (h) => {
+  h.setFixture(fixture([]));
+  const provider = assessments(id => ({ actionable: { type: 'boolean', probabilityTrue: 0.01 },
+    ...(id === 'aa04' ? { credential_fraud: { type: 'boolean' as const, probabilityTrue: 0.9 } } : {}) }));
+  const config = triageConfig(h.config, { mode: 'live', actions: ['wake', 'digest'] });
+  const targets: string[] = [];
+  let workflow: ReturnType<typeof createMailWorkflow>;
+  workflow = createMailWorkflow({ config, stateDir: h.stateDir, ...provider, subagent: {
+    run: async ({ sessionKey, message: prompt }) => {
+      const jobId = jobIdFromPrompt(prompt);
+      targets.push(workflow.context(jobId, sessionKey).job.target_id);
+      workflow.complete({ jobId, sessionKey, reason: 'Conversation update acknowledged' });
+      return { runId: jobId, sessionKey };
+    }, waitForRun: async () => ({ status: 'ok' }),
+  } });
+  try {
+    await workflow.start();
+    const replies = [1, 2, 3, 4].map(i => { const m = message(`aa0${i}`, 'Thanks, that works.'); m.threadId = `bb0${i}`; return m; });
+    const f = separateThreads(replies);
+    for (const [i, reply] of replies.entries()) {
+      const prior = message(`cc0${i}`, 'My earlier contribution', { sender: account, received: Date.now() - 60000 });
+      prior.threadId = reply.threadId;
+      // Merely quoting/forging our From address or having other thread traffic is insufficient.
+      if (i !== 1) prior.labelIds = ['SENT'];
+      if (i === 2) prior.internalDate = String(Number(reply.internalDate) + 1000);
+      f.threads[reply.threadId].thread.messages.unshift(prior);
+    }
+    h.setFixture(f); await workflow.poll(); await waitFor(() => !workflow.status().working);
+    assert.deepEqual(targets, ['aa01']);
+    assert.deepEqual(workflow.status().messages, { done: 1, digest: 2, needs_review: 1 });
+  } finally { await workflow.stop(); }
+}));
+
+test('digest cadence batches staggered arrivals and survives restart and interval changes', async (t) => withHarness(async (h) => {
+  t.mock.timers.enable({ apis: ['Date'], now: Date.now() });
+  const advance = (minutes: number) => t.mock.timers.setTime(Date.now() + minutes * 60000);
+  h.setFixture(fixture([]));
+  const provider = assessments(() => ({ actionable: { type: 'boolean', probabilityTrue: 0.01 } }));
+  const policy = { ...structuredClone(defaultPolicy), digestMinutes: 60 };
+  const config = triageConfig(h.config, { mode: 'live', actions: ['wake', 'digest'], policy });
+  let workflow: ReturnType<typeof createMailWorkflow>;
+  const batches: string[][] = [];
+  const subagent = {
+    run: async ({ sessionKey, message: prompt }: { sessionKey: string; message: string }) => {
+      const jobId = /Job ID: ([a-f0-9]{24})/.exec(prompt)![1];
+      const context = workflow.context(jobId, sessionKey);
+      assert.equal(context.replyAllowed, false);
+      batches.push(context.messages.map(m => m.id));
+      workflow.complete({ jobId, sessionKey, reason: 'Digest summarized' });
+      return { runId: jobId, sessionKey };
+    }, waitForRun: async () => ({ status: 'ok' }),
+  };
+  workflow = createMailWorkflow({ config, stateDir: h.stateDir, ...provider, subagent });
+  try {
+    await workflow.start();
+    h.setFixture(fixture([message('aa01', 'First update')])); await workflow.poll();
+    advance(30);
+    h.setFixture(fixture([message('aa02', 'Another update')])); await workflow.poll();
+    advance(29); await workflow.processNext(); assert.equal(batches.length, 0);
+    advance(1); await workflow.processNext();
+    assert.deepEqual(batches, [['aa01', 'aa02']], 'one batch includes the newer pending item too');
+    advance(1);
+    h.setFixture(fixture([message('aa03', 'Next interval')])); await workflow.poll();
     await workflow.stop();
-    const digestProvider = assessments(() => ({ actionable: { type: 'boolean', probabilityTrue: 0.01 } }));
-    workflow = createMailWorkflow({ config, stateDir: h.stateDir, ...digestProvider, subagent });
-    h.setFixture(fixture([])); await workflow.start();
-    h.setFixture(fixture([message('aa02', 'For information')])); await workflow.poll();
-    const digestDb = h.db(); digestDb.prepare("UPDATE messages SET due=0 WHERE status='digest'").run(); digestDb.close();
-    await workflow.processNext(); assert.equal(runs, 3); assert.equal(workflow.status().messages.done, 2);
+    workflow = createMailWorkflow({ config, stateDir: h.stateDir, ...provider, subagent });
+    await workflow.start(); await workflow.processNext(); assert.equal(batches.length, 1);
+    advance(29);
+    workflow.policyUpdate({ ...policy, digestMinutes: 30 }, 1, 'owner');
+    await workflow.poll(); await workflow.processNext();
+    assert.deepEqual(batches, [['aa01', 'aa02'], ['aa03']], 'shortening the interval applies to already pending mail');
+    assert.equal(provider.calls(), 3, 'scheduling changes do not reclassify unchanged evidence');
     await workflow.stop();
-    workflow = createMailWorkflow({ config, stateDir: h.stateDir, ...digestProvider, subagent });
-    await workflow.start(); await workflow.processNext(); assert.equal(runs, 3);
+    workflow = createMailWorkflow({ config, stateDir: h.stateDir, ...provider, subagent });
+    await workflow.start(); await workflow.processNext(); assert.equal(batches.length, 2);
+  } finally { await workflow.stop(); }
+}));
+
+test('external conversation wakes require opt-in, fresh authenticated human replies and retain send restrictions', async (t) => withHarness(async (h) => {
+  t.mock.timers.enable({ apis: ['Date'], now: Date.now() });
+  const provider = assessments(id => ({ actionable: { type: 'boolean', probabilityTrue: 0.01 },
+    ...(id === 'aa07' ? { credential_fraud: { type: 'boolean' as const, probabilityTrue: 0.9 } } : {}) }));
+  const disabled = triageConfig(h.config, { mode: 'live', actions: ['wake', 'digest'] });
+  const enabled = triageConfig(h.config, { mode: 'live', actions: ['wake', 'digest'], wakeOnExternalReplies: true });
+  const reply = (id: string, headers: Record<string, string> = {}) => {
+    const m = message(id, 'Here is the update', { sender: 'guest@elsewhere.test', headers });
+    m.threadId = `bb${id.slice(2)}`;
+    return m;
+  };
+  const conversations = (messages: GmailMessage[]) => {
+    const f = separateThreads(messages);
+    for (const m of messages) {
+      const sent = message(`cc${m.id.slice(2)}`, 'My earlier message', { sender: account, received: Date.now() - 3600000 });
+      sent.threadId = m.threadId; sent.labelIds = m.id === 'aa03' ? ['INBOX'] : ['SENT'];
+      f.threads[m.threadId].thread.messages.unshift(sent);
+    }
+    return f;
+  };
+  let workflow: ReturnType<typeof createMailWorkflow>;
+  const targets: string[] = [];
+  const subagent = {
+    run: async ({ sessionKey, message: prompt }: { sessionKey: string; message: string }) => {
+      const jobId = jobIdFromPrompt(prompt), context = workflow.context(jobId, sessionKey);
+      targets.push(context.job.target_id); assert.equal(context.replyAllowed, false);
+      await assert.rejects(workflow.reply({ jobId, sessionKey, body: 'Not authorized' }), /reply target rejected/);
+      workflow.complete({ jobId, sessionKey, reason: 'External update reviewed without sending' });
+      return { runId: jobId, sessionKey };
+    }, waitForRun: async () => ({ status: 'ok' }),
+  };
+  h.setFixture(fixture([]));
+  workflow = createMailWorkflow({ config: disabled, stateDir: h.stateDir, ...provider, subagent });
+  try {
+    await workflow.start(); h.setFixture(conversations([reply('aa01')])); await workflow.poll();
+    assert.equal(provider.calls(), 0, 'unapproved external mail is not shared for classification');
+    await workflow.stop();
+    const old = reply('aa06');
+    t.mock.timers.setTime(Date.now() + 60000);
+    h.setFixture(fixture([]));
+    workflow = createMailWorkflow({ config: enabled, stateDir: h.stateDir, ...provider, subagent });
+    await workflow.start();
+    h.setFixture(conversations([reply('aa02'), reply('aa03'), reply('aa04', { 'Auto-Submitted': 'auto-replied' }),
+      reply('aa05', { 'Authentication-Results': 'mx.google.com; dmarc=fail header.from=elsewhere.test' }), old, reply('aa07')]));
+    await workflow.poll(); await waitFor(() => !workflow.status().working);
+    assert.deepEqual(targets, ['aa02']); assert.equal(provider.calls(), 2);
+    assert.equal(workflow.status().messages.needs_review, 1, 'security checks still hold conversation replies');
+    assert.ok(h.calls().some(args => args.includes('search') && args.some(value => value.includes('in:inbox'))));
+    assert.equal(h.calls().filter(args => args.includes('send')).length, 0);
+    await workflow.stop();
+    h.setFixture(fixture([]));
+    workflow = createMailWorkflow({ config: disabled, stateDir: h.stateDir, ...provider, subagent });
+    await workflow.start(); await workflow.stop();
+    const disabledPeriod = reply('aa08');
+    t.mock.timers.setTime(Date.now() + 60000);
+    workflow = createMailWorkflow({ config: enabled, stateDir: h.stateDir, ...provider, subagent });
+    await workflow.start(); h.setFixture(conversations([disabledPeriod, reply('aa09')]));
+    await workflow.poll(); await waitFor(() => !workflow.status().working);
+    assert.deepEqual(targets, ['aa02', 'aa09'], 're-enabling does not replay the disabled period');
   } finally { await workflow.stop(); }
 }));

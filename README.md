@@ -86,6 +86,8 @@ Use `/email-watch-status` to see polling errors and queue/job counts. SQLite and
 conversation files live under the Gateway state directory at
 `gog-email-watch/<mailbox-hash>/`, outside the installed package. These files contain
 mail content; preserve the database across upgrades to retain deduplication.
+The plugin uses normal process-umask file permissions, without forcing 0600/0700
+or checking file ownership. It does not change existing files' modes on startup.
 
 ## Optional inbox triage
 
@@ -98,6 +100,7 @@ To start in shadow mode, add this to the plugin's `config`:
     "decisionModel": "typesafe/jev-1.13.0",
     "mode": "shadow",
     "observe": "approved",
+    "wakeOnExternalReplies": false,
     "actions": ["label", "wake", "digest"],
     "reviewActions": ["archive", "trash"]
   }
@@ -122,10 +125,10 @@ host/provider adapter and Platform API credentials; it is not claimed tested her
   Switching to `live` affects new work; shadow items require explicit reevaluation.
 - `observe: inbox` broadens observation, **not reply authority**. Its activation
   boundary starts when enabled; historical mail is scanned separately for review.
-- `actions` is owner authority. `reviewActions` always takes precedence for
+- `actions` configures permitted actions. `reviewActions` always takes precedence for
   archive/trash, even if the same action is also in `actions`. Default review mode
   never archives or trashes. Removing that protection and adding action authority
-  requires an explicit owner config change and restart.
+  requires a plugin config change and restart.
 - Mutations target explicit message IDs, preserve read/unread and unrelated labels,
   and create labels only under `Gog/`. No permanent deletion or Trash purge exists.
   Gmail automatically deletes Trash after 30 days.
@@ -140,20 +143,81 @@ host/provider adapter and Platform API credentials; it is not claimed tested her
   Review real proposals before enabling mailbox dispositions.
 - `excludedSenders`/`excludedDomains` skip externally owned workflows before inference;
   this is not an acknowledgment that another workflow received the work.
-- Owner `allowedAgents` bounds routing; `policyEditors` bounds policy/review tools
-  (both default to the mailbox agent). Policy changes also require trusted owner
-  context and are denied in email and delegated subagent sessions.
+- `allowedAgents` bounds routing (defaults to the mailbox agent). Policy/review
+  tools have no additional owner, agent-ID or session-type access gate. Any agent
+  given these tools can use them, including delegated agents. The old
+  `policyEditors` setting is accepted but ignored for upgrade compatibility.
+  Agents must treat mail as untrusted evidence, not instructions to change policy.
 - The default daily classifier budget is 200. Unavailable/invalid results retain
   mail, retry with backoff and then hold it. No missing judgment is treated as safe.
 
 ### Policy and agent tools
 
-`gog_email_policy_get` returns the current version and owner envelope.
+`gog_email_policy_get` returns the current version and plugin configuration limits.
 `gog_email_policy_preview` compares a candidate against up to 50 cached assessments
 without model calls, Gmail writes or dispatch. Threshold-only edits reuse estimates;
 new questions/interests/models require new evaluations. `gog_email_policy_update`
 uses `expectedVersion` and saves immutable history; restore a previous document by
-saving it as a new version. Policy cannot alter the owner envelope.
+saving it as a new version. Provider, senders, protections and permitted actions
+are configured separately in the plugin config, not in the policy document.
+
+### What wakes the agent?
+
+Security flags, unavailable judgments and incomplete evidence take precedence:
+retain the mail for review. Otherwise the first matching policy rule wins. The
+built-in policy wakes for approved requests with actionability at least 0.8, or
+new replies in a conversation the mailbox account participated in. Marketing and
+newsletters propose trash/archive; protections can turn those proposals into a
+review hold. Other mail falls back to a digest.
+
+`conversationReply` is a deterministic fact: the same Gmail thread contains an
+earlier message labeled **Sent**, sent from the account or one of its configured
+aliases. Quoted From headers, thread length, and other people's activity alone
+do not establish participation. Authentication, automation exclusions, safety
+checks and quiet hours still apply.
+
+By default only approved senders can wake the agent. Enable
+`triage.wakeOnExternalReplies: true` to also wake for authenticated, non-automated
+external replies in participated threads. This searches the inbox to find them,
+but in `observe: approved` mode unrelated external mail is not classified. Only
+new replies after enablement qualify; disabling/re-enabling does not replay the
+disabled period. This is **wake-only authority**: the external sender cannot issue
+new authorized instructions, and `gog_email_reply` still requires an approved
+sender. The toggle cannot be changed through agent policy tools.
+
+Persisted policies are never silently replaced on upgrade. Existing mailboxes
+can preview and add this rule before newsletter/marketing rules, using the normal
+policy update tool:
+
+```json
+{
+  "id": "conversation-reply",
+  "all": [{ "fact": "conversationReply", "equals": true }],
+  "then": { "disposition": "retain", "attention": "wake", "labels": ["conversation"] }
+}
+```
+
+### Choosing digest frequency
+
+`policy.digestMinutes` controls the **minimum interval between digest agent runs**
+per destination: 5–10080 minutes, default 1440 (24 hours). For example, use `60`
+for hourly batches or `240` for four-hourly batches. An agent can call
+`gog_email_policy_get`, change `document.digestMinutes`, and submit that document
+plus `expectedVersion` to `gog_email_policy_update`. No owner-context check,
+separate scheduling tool or timer is needed.
+
+The first batch waits one interval from the first pending message; subsequent
+batches run no sooner than one interval after the previous digest started. Each
+batch includes up to 50 currently pending items for that destination, including
+newer arrivals. Empty queues never wake the agent. Quiet hours postpone delivery;
+pending mail and prior run times survive restarts. Changing the interval applies
+to pending mail on the next poll without new classifier calls. The existing poll
+timer and higher-priority immediate jobs can make delivery later, never more frequent.
+
+Review-only scans do not schedule digests or wake-ups. Digests run the agent but
+do not automatically send a summary to Slack, email or another destination.
+
+### Policy format and job tools
 
 A policy has `schemaVersion: 1`, `interests`, typed `questions` (boolean, choice,
 score), ordered `rules` with `all` conditions, a `default` outcome,
@@ -190,7 +254,7 @@ assessment for an unexecuted hold; it cannot override safeguards. `close` requir
 manual reconciliation of a held agent job and a note. It never removes reply
 deduplication or retries a send. `correct` saves feedback only—no automatic training
 or policy change. The equivalent `gog-email-watch.review` Gateway RPC requires
-`operator.admin`. Incoming mail cannot invoke these controls to change policy.
+`operator.admin` through the host's normal authenticated Gateway connection.
 
 Uncertain mailbox effects are reconciled against Gmail before proceeding. An
 uncertain send is never replayed. An unrestricted agent with shell access to the

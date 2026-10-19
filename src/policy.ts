@@ -14,7 +14,7 @@ const question = Type.Union([
   Type.Object({ type: Type.Literal("score"), instructions: text, criteria: Type.Array(text, { minItems: 2, maxItems: 10 }) }, object),
 ]);
 const condition = Type.Union([
-  Type.Object({ fact: Type.Union([Type.Literal("sender"), Type.Literal("domain"), Type.Literal("approved"), Type.Literal("authenticated"), Type.Literal("automated")]), equals: Type.Union([Type.String({ maxLength: 320 }), Type.Boolean()]) }, object),
+  Type.Object({ fact: Type.Union([Type.Literal("sender"), Type.Literal("domain"), Type.Literal("approved"), Type.Literal("authenticated"), Type.Literal("automated"), Type.Literal("conversationReply")]), equals: Type.Union([Type.String({ maxLength: 320 }), Type.Boolean()]) }, object),
   Type.Object({ question: id, equals: id }, object),
   Type.Object({ question: id, atLeast: Type.Number({ minimum: 0, maximum: 9 }) }, object),
   Type.Object({ question: id, atMost: Type.Number({ minimum: 0, maximum: 9 }) }, object),
@@ -31,18 +31,19 @@ export const PolicySchema = Type.Object({
   questions: Type.Record(id, question, { maxProperties: 12 }),
   rules: Type.Array(Type.Object({ id, all: Type.Array(condition, { maxItems: 12 }), then: OutcomeSchema }, object), { maxItems: 50 }),
   default: OutcomeSchema,
-  digestMinutes: Type.Integer({ minimum: 5, maximum: 10080 }),
+  digestMinutes: Type.Integer({ minimum: 5, maximum: 10080, description: "Minimum minutes between digest agent runs per destination. First batch waits this long; empty inboxes never wake the agent." }),
   quietHours: Type.Optional(Type.Object({ timezone: text, start: Type.Integer({ minimum: 0, maximum: 23 }), end: Type.Integer({ minimum: 0, maximum: 23 }) }, object)),
 }, object);
 
 export const TriageSchema = Type.Object({
   mode: Type.Union([Type.Literal("shadow"), Type.Literal("live")]),
   observe: Type.Union([Type.Literal("approved"), Type.Literal("inbox")]),
+  wakeOnExternalReplies: Type.Boolean({ description: "Allow authenticated human replies in threads with an earlier Sent message from this account to wake the agent. Does not grant reply/send authority. Default false." }),
   decisionModel: text,
   actions: Type.Array(action, { uniqueItems: true, maxItems: 5 }),
   reviewActions: Type.Array(Type.Union([Type.Literal("archive"), Type.Literal("trash")]), { uniqueItems: true, maxItems: 2 }),
   allowedAgents: strings,
-  policyEditors: strings,
+  policyEditors: Type.Optional(Type.Array(text, { maxItems: 64, uniqueItems: true, description: "Deprecated and ignored. Agents with policy/review tools can use them without an editor allowlist." })),
   protectedCategories: strings,
   protectedLabels: strings,
   excludedSenders: strings,
@@ -55,7 +56,7 @@ export const TriageInputSchema = Type.Object({ ...Type.Partial(TriageSchema).pro
 export type Policy = Static<typeof PolicySchema>;
 export type TriageConfig = Static<typeof TriageSchema>;
 export type Outcome = Static<typeof OutcomeSchema>;
-export type Facts = { sender: string; domain: string; approved: boolean; authenticated: boolean; automated: boolean; labels: string[] };
+export type Facts = { sender: string; domain: string; approved: boolean; authenticated: boolean; automated: boolean; conversationReply: boolean; labels: string[] };
 export type Plan = Outcome & { ruleId: string; reason: string; quarantine: boolean; mutationReview: boolean };
 
 export const securityQuestions = {
@@ -71,6 +72,7 @@ export const defaultPolicy: Policy = {
   },
   rules: [
     { id: "approved-request", all: [{ fact: "approved", equals: true }, { question: "actionable", atLeast: 0.8 }], then: { disposition: "retain", attention: "wake", labels: ["action"] } },
+    { id: "conversation-reply", all: [{ fact: "conversationReply", equals: true }], then: { disposition: "retain", attention: "wake", labels: ["conversation"] } },
     { id: "marketing-review", all: [{ question: "category", equals: "marketing" }], then: { disposition: "trash", attention: "none", labels: ["marketing"] } },
     { id: "newsletter-review", all: [{ question: "category", equals: "newsletter" }], then: { disposition: "archive", attention: "digest", labels: ["newsletter"] } },
   ],
@@ -84,7 +86,7 @@ export function hash(value: unknown): string {
 export function parseTriage(value: unknown, agentId: string): TriageConfig | undefined {
   if (value === undefined) return;
   if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("triage must be an object");
-  const merged: unknown = { mode: "shadow", observe: "approved", actions: ["label", "wake", "digest"], reviewActions: ["archive", "trash"], allowedAgents: [agentId], policyEditors: [agentId], protectedCategories: ["request", "invoice", "receipt", "scheduling", "security"], protectedLabels: ["STARRED", "IMPORTANT"], excludedSenders: [], excludedDomains: [], securityThreshold: 0.1, maxEvaluationsPerDay: 200, ...value };
+  const merged: unknown = { mode: "shadow", observe: "approved", wakeOnExternalReplies: false, actions: ["label", "wake", "digest"], reviewActions: ["archive", "trash"], allowedAgents: [agentId], protectedCategories: ["request", "invoice", "receipt", "scheduling", "security"], protectedLabels: ["STARRED", "IMPORTANT"], excludedSenders: [], excludedDomains: [], securityThreshold: 0.1, maxEvaluationsPerDay: 200, ...value };
   if (!Value.Check(TriageSchema, merged)) throw new Error("invalid triage configuration");
   merged.excludedSenders = merged.excludedSenders.map(value => value.toLowerCase());
   merged.excludedDomains = merged.excludedDomains.map(value => value.toLowerCase());
@@ -95,10 +97,10 @@ export function parseTriage(value: unknown, agentId: string): TriageConfig | und
 
 export function parsePolicy(value: unknown, envelope: TriageConfig): Policy {
   if (!Value.Check(PolicySchema, value)) throw new Error("invalid policy document");
-  if (Object.keys(value.questions).some(key => key in securityQuestions || key === "protected_content")) throw new Error("safety questions are owner controlled");
+  if (Object.keys(value.questions).some(key => key in securityQuestions || key === "protected_content")) throw new Error("safety question names are reserved");
   if (new Set(value.rules.map(rule => rule.id)).size !== value.rules.length) throw new Error("rule IDs must be unique");
   for (const outcome of [...value.rules.map(rule => rule.then), value.default]) {
-    if (outcome.agentId && !envelope.allowedAgents.includes(outcome.agentId)) throw new Error("policy destination exceeds owner authority");
+    if (outcome.agentId && !envelope.allowedAgents.includes(outcome.agentId)) throw new Error("policy destination is not configured in allowedAgents");
     if (outcome.disposition === "trash" && outcome.attention !== "none" && outcome.attention !== "review") throw new Error("trash cannot dispatch work");
     if (outcome.disposition !== "retain" && !envelope.actions.includes(outcome.disposition) && !envelope.reviewActions.includes(outcome.disposition)) throw new Error("disposition is not permitted, even for review");
   }
@@ -174,7 +176,8 @@ export function evaluatePolicy(policy: Policy, envelope: TriageConfig, facts: Fa
     plan.mutationReview = envelope.reviewActions.includes(plan.disposition) || !envelope.actions.includes(plan.disposition);
   }
   if (!envelope.actions.includes("label")) plan.labels = [];
-  if (plan.attention === "wake" && (!facts.approved || !envelope.actions.includes("wake"))) return reviewPlan("wake-up exceeds sender or action authority");
+  const externalReply = envelope.wakeOnExternalReplies && facts.conversationReply && facts.authenticated && !facts.automated;
+  if (plan.attention === "wake" && ((!facts.approved && !externalReply) || !envelope.actions.includes("wake"))) return reviewPlan("wake-up exceeds sender or action authority");
   if (plan.attention === "wake" && quiet(policy)) { plan.attention = "digest"; plan.reason += "; quiet hours"; }
   if (plan.attention === "digest" && !envelope.actions.includes("digest")) plan.attention = "review";
   return plan;

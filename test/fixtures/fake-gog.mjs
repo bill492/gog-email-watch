@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 
-import { appendFileSync, readFileSync } from 'node:fs';
+import { appendFileSync, readFileSync, writeFileSync } from 'node:fs';
 import { DatabaseSync } from 'node:sqlite';
 
 const fixture = JSON.parse(readFileSync(process.env.GOG_TEST_FIXTURE, 'utf8'));
@@ -18,7 +18,7 @@ if (fixture.probeWritableDb) {
 }
 let result;
 if (command[1] === 'messages' && command[2] === 'search') {
-  result = fixture.search;
+  result = command.includes('--page') ? fixture.pages?.[command[command.indexOf('--page') + 1]] : fixture.search;
 } else if (command[1] === 'thread' && command[2] === 'get') {
   result = fixture.threads?.[command[3]];
 } else if (command[1] === 'send') {
@@ -26,7 +26,23 @@ if (command[1] === 'messages' && command[2] === 'search') {
     process.stderr.write('controlled fake gog send failure\n');
     process.exit(1);
   }
-  result = fixture.send ?? { id: 'sent-1' };
+  result = fixture.send ?? { messageId: 'cc01', threadId: 'bb01' };
+} else if (command[1] === 'labels' && command[2] === 'list') {
+  result = { labels: fixture.labels ?? [] };
+} else if (command[1] === 'labels' && command[2] === 'create') {
+  const label = { name: command[3], id: `Label_${(fixture.labels?.length ?? 0) + 1}` };
+  fixture.labels = [...(fixture.labels ?? []), label];
+  result = { label };
+  writeFileSync(process.env.GOG_TEST_FIXTURE, JSON.stringify(fixture));
+} else if (command[1] === 'batch' && command[2] === 'modify') {
+  const ids = command.slice(3).filter(value => /^[a-f0-9]+$/.test(value));
+  const add = command.includes('--add') ? command[command.indexOf('--add') + 1].split(',') : [];
+  const remove = command.includes('--remove') ? command[command.indexOf('--remove') + 1].split(',') : [];
+  for (const value of Object.values(fixture.threads)) for (const message of value.thread.messages) {
+    if (ids.includes(message.id)) message.labelIds = [...new Set([...message.labelIds.filter(id => !remove.includes(id)), ...add])];
+  }
+  writeFileSync(process.env.GOG_TEST_FIXTURE, JSON.stringify(fixture));
+  result = fixture.modifyUncertain ? {} : { modified: ids, count: ids.length, addedLabels: add, removedLabels: remove };
 }
 
 if (result === undefined) {

@@ -6,9 +6,12 @@ Port Alfie's working email automation into a reusable OpenClaw plugin. Use each
 node's existing gog CLI and credentials, with configurable mailbox, sender domains
 and individual email addresses.
 
-**This is a port, not a redesign.** Preserve the existing workflow, including
-thread context and reply/skip handling. Do not silently replace it with a
-notification-only watcher or introduce new restrictions on the agent.
+Version 0.2 extends the port with the inbox-triage feature in issue #1. Preserve
+thread context and reply/skip handling when triage is omitted. When explicitly
+enabled, add owner-bounded screening, versioned policy, review-only historical
+scans, scoped mailbox effects, digests, completion/defer and recovery controls.
+The original port constraints below still apply where not superseded by this
+explicit feature scope. The saved review/design is in `tmp/2026-10-19-inbox-triage-review-and-plan.md`.
 
 ## Keep it lean
 
@@ -105,6 +108,7 @@ node migration requires separate authorization. Run the relevant build, package 
 behavior checks; once they pass, stop unless something changed or still looks wrong.
 Do not add tests for coverage or implementation details.
 
-No extra providers, multi-account framework, dashboard, OAuth setup, Pub/Sub,
+Reuse the host Decisions runtime; no plugin-owned provider transports. No
+multi-account framework, dashboard, OAuth setup, Pub/Sub,
 standalone daemon or fleet orchestration. Installation on Alfie and other nodes is
 a later step; do not replace their running automation during development.

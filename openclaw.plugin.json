@@ -1,33 +1,672 @@
 {
   "id": "gog-email-watch",
   "name": "Gog Email Watch",
-  "version": "0.1.1",
-  "description": "Poll Gmail through the existing gog CLI and dispatch approved mail to an OpenClaw agent.",
-  "activation": { "onStartup": true },
-  "contracts": { "tools": ["gog_email_reply", "gog_email_skip"] },
+  "version": "0.2.0",
+  "description": "Policy-based inbox triage with review-only maintenance and approved-sender agent workflows.",
+  "activation": {
+    "onStartup": true
+  },
+  "contracts": {
+    "tools": [
+      "gog_email_reply",
+      "gog_email_skip",
+      "gog_email_context",
+      "gog_email_complete",
+      "gog_email_defer",
+      "gog_email_policy_get",
+      "gog_email_policy_preview",
+      "gog_email_policy_update",
+      "gog_email_review"
+    ],
+    "gatewayMethods": [
+      "gog-email-watch.review"
+    ]
+  },
+  "cliCommands": [
+    {
+      "name": "email-watch",
+      "description": "Review inbox archive/trash proposals",
+      "hasSubcommands": true
+    }
+  ],
   "configSchema": {
     "type": "object",
     "additionalProperties": false,
-    "required": ["account"],
+    "required": [
+      "account"
+    ],
     "properties": {
-      "account": { "type": "string", "minLength": 1 },
-      "domains": { "type": "array", "items": { "type": "string" }, "default": [] },
-      "senders": { "type": "array", "items": { "type": "string" }, "default": [] },
-      "agentId": { "type": "string", "default": "main", "minLength": 1 },
-      "pollIntervalSeconds": { "type": "integer", "minimum": 1, "default": 120 },
-      "gogPath": { "type": "string", "default": "gog", "minLength": 1 },
-      "selfAddresses": { "type": "array", "items": { "type": "string" }, "default": [] }
+      "account": {
+        "type": "string",
+        "minLength": 1
+      },
+      "domains": {
+        "type": "array",
+        "items": {
+          "type": "string"
+        },
+        "default": []
+      },
+      "senders": {
+        "type": "array",
+        "items": {
+          "type": "string"
+        },
+        "default": []
+      },
+      "agentId": {
+        "type": "string",
+        "default": "main",
+        "minLength": 1
+      },
+      "pollIntervalSeconds": {
+        "type": "integer",
+        "minimum": 1,
+        "default": 120
+      },
+      "gogPath": {
+        "type": "string",
+        "default": "gog",
+        "minLength": 1
+      },
+      "selfAddresses": {
+        "type": "array",
+        "items": {
+          "type": "string"
+        },
+        "default": []
+      },
+      "triage": {
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "decisionModel"
+        ],
+        "properties": {
+          "mode": {
+            "anyOf": [
+              {
+                "const": "shadow",
+                "type": "string"
+              },
+              {
+                "const": "live",
+                "type": "string"
+              }
+            ]
+          },
+          "observe": {
+            "anyOf": [
+              {
+                "const": "approved",
+                "type": "string"
+              },
+              {
+                "const": "inbox",
+                "type": "string"
+              }
+            ]
+          },
+          "decisionModel": {
+            "minLength": 1,
+            "maxLength": 2000,
+            "type": "string"
+          },
+          "actions": {
+            "uniqueItems": true,
+            "maxItems": 5,
+            "type": "array",
+            "items": {
+              "anyOf": [
+                {
+                  "const": "label",
+                  "type": "string"
+                },
+                {
+                  "const": "archive",
+                  "type": "string"
+                },
+                {
+                  "const": "trash",
+                  "type": "string"
+                },
+                {
+                  "const": "wake",
+                  "type": "string"
+                },
+                {
+                  "const": "digest",
+                  "type": "string"
+                }
+              ]
+            }
+          },
+          "reviewActions": {
+            "uniqueItems": true,
+            "maxItems": 2,
+            "type": "array",
+            "items": {
+              "anyOf": [
+                {
+                  "const": "archive",
+                  "type": "string"
+                },
+                {
+                  "const": "trash",
+                  "type": "string"
+                }
+              ]
+            }
+          },
+          "allowedAgents": {
+            "maxItems": 64,
+            "uniqueItems": true,
+            "type": "array",
+            "items": {
+              "minLength": 1,
+              "maxLength": 2000,
+              "type": "string"
+            }
+          },
+          "policyEditors": {
+            "maxItems": 64,
+            "uniqueItems": true,
+            "type": "array",
+            "items": {
+              "minLength": 1,
+              "maxLength": 2000,
+              "type": "string"
+            }
+          },
+          "protectedCategories": {
+            "maxItems": 64,
+            "uniqueItems": true,
+            "type": "array",
+            "items": {
+              "minLength": 1,
+              "maxLength": 2000,
+              "type": "string"
+            }
+          },
+          "protectedLabels": {
+            "maxItems": 64,
+            "uniqueItems": true,
+            "type": "array",
+            "items": {
+              "minLength": 1,
+              "maxLength": 2000,
+              "type": "string"
+            }
+          },
+          "excludedSenders": {
+            "maxItems": 64,
+            "uniqueItems": true,
+            "type": "array",
+            "items": {
+              "minLength": 1,
+              "maxLength": 2000,
+              "type": "string"
+            }
+          },
+          "excludedDomains": {
+            "maxItems": 64,
+            "uniqueItems": true,
+            "type": "array",
+            "items": {
+              "minLength": 1,
+              "maxLength": 2000,
+              "type": "string"
+            }
+          },
+          "securityThreshold": {
+            "minimum": 0.01,
+            "maximum": 0.5,
+            "type": "number"
+          },
+          "maxEvaluationsPerDay": {
+            "minimum": 1,
+            "maximum": 10000,
+            "type": "integer"
+          },
+          "policy": {
+            "additionalProperties": false,
+            "type": "object",
+            "required": [
+              "schemaVersion",
+              "interests",
+              "questions",
+              "rules",
+              "default",
+              "digestMinutes"
+            ],
+            "properties": {
+              "schemaVersion": {
+                "const": 1,
+                "type": "number"
+              },
+              "interests": {
+                "maxLength": 4000,
+                "type": "string"
+              },
+              "questions": {
+                "maxProperties": 12,
+                "type": "object",
+                "patternProperties": {
+                  "^[a-z][a-z0-9_-]{0,63}$": {
+                    "anyOf": [
+                      {
+                        "additionalProperties": false,
+                        "type": "object",
+                        "required": [
+                          "type",
+                          "instructions"
+                        ],
+                        "properties": {
+                          "type": {
+                            "const": "boolean",
+                            "type": "string"
+                          },
+                          "instructions": {
+                            "minLength": 1,
+                            "maxLength": 2000,
+                            "type": "string"
+                          }
+                        }
+                      },
+                      {
+                        "additionalProperties": false,
+                        "type": "object",
+                        "required": [
+                          "type",
+                          "instructions",
+                          "criteria"
+                        ],
+                        "properties": {
+                          "type": {
+                            "const": "choice",
+                            "type": "string"
+                          },
+                          "instructions": {
+                            "minLength": 1,
+                            "maxLength": 2000,
+                            "type": "string"
+                          },
+                          "criteria": {
+                            "minProperties": 2,
+                            "maxProperties": 20,
+                            "type": "object",
+                            "patternProperties": {
+                              "^[a-z][a-z0-9_-]{0,63}$": {
+                                "minLength": 1,
+                                "maxLength": 2000,
+                                "type": "string"
+                              }
+                            }
+                          }
+                        }
+                      },
+                      {
+                        "additionalProperties": false,
+                        "type": "object",
+                        "required": [
+                          "type",
+                          "instructions",
+                          "criteria"
+                        ],
+                        "properties": {
+                          "type": {
+                            "const": "score",
+                            "type": "string"
+                          },
+                          "instructions": {
+                            "minLength": 1,
+                            "maxLength": 2000,
+                            "type": "string"
+                          },
+                          "criteria": {
+                            "minItems": 2,
+                            "maxItems": 10,
+                            "type": "array",
+                            "items": {
+                              "minLength": 1,
+                              "maxLength": 2000,
+                              "type": "string"
+                            }
+                          }
+                        }
+                      }
+                    ]
+                  }
+                }
+              },
+              "rules": {
+                "maxItems": 50,
+                "type": "array",
+                "items": {
+                  "additionalProperties": false,
+                  "type": "object",
+                  "required": [
+                    "id",
+                    "all",
+                    "then"
+                  ],
+                  "properties": {
+                    "id": {
+                      "pattern": "^[a-z][a-z0-9_-]{0,63}$",
+                      "type": "string"
+                    },
+                    "all": {
+                      "maxItems": 12,
+                      "type": "array",
+                      "items": {
+                        "anyOf": [
+                          {
+                            "additionalProperties": false,
+                            "type": "object",
+                            "required": [
+                              "fact",
+                              "equals"
+                            ],
+                            "properties": {
+                              "fact": {
+                                "anyOf": [
+                                  {
+                                    "const": "sender",
+                                    "type": "string"
+                                  },
+                                  {
+                                    "const": "domain",
+                                    "type": "string"
+                                  },
+                                  {
+                                    "const": "approved",
+                                    "type": "string"
+                                  },
+                                  {
+                                    "const": "authenticated",
+                                    "type": "string"
+                                  },
+                                  {
+                                    "const": "automated",
+                                    "type": "string"
+                                  }
+                                ]
+                              },
+                              "equals": {
+                                "anyOf": [
+                                  {
+                                    "maxLength": 320,
+                                    "type": "string"
+                                  },
+                                  {
+                                    "type": "boolean"
+                                  }
+                                ]
+                              }
+                            }
+                          },
+                          {
+                            "additionalProperties": false,
+                            "type": "object",
+                            "required": [
+                              "question",
+                              "equals"
+                            ],
+                            "properties": {
+                              "question": {
+                                "pattern": "^[a-z][a-z0-9_-]{0,63}$",
+                                "type": "string"
+                              },
+                              "equals": {
+                                "pattern": "^[a-z][a-z0-9_-]{0,63}$",
+                                "type": "string"
+                              }
+                            }
+                          },
+                          {
+                            "additionalProperties": false,
+                            "type": "object",
+                            "required": [
+                              "question",
+                              "atLeast"
+                            ],
+                            "properties": {
+                              "question": {
+                                "pattern": "^[a-z][a-z0-9_-]{0,63}$",
+                                "type": "string"
+                              },
+                              "atLeast": {
+                                "minimum": 0,
+                                "maximum": 9,
+                                "type": "number"
+                              }
+                            }
+                          },
+                          {
+                            "additionalProperties": false,
+                            "type": "object",
+                            "required": [
+                              "question",
+                              "atMost"
+                            ],
+                            "properties": {
+                              "question": {
+                                "pattern": "^[a-z][a-z0-9_-]{0,63}$",
+                                "type": "string"
+                              },
+                              "atMost": {
+                                "minimum": 0,
+                                "maximum": 9,
+                                "type": "number"
+                              }
+                            }
+                          }
+                        ]
+                      }
+                    },
+                    "then": {
+                      "additionalProperties": false,
+                      "type": "object",
+                      "required": [
+                        "disposition",
+                        "attention",
+                        "labels"
+                      ],
+                      "properties": {
+                        "disposition": {
+                          "anyOf": [
+                            {
+                              "const": "retain",
+                              "type": "string"
+                            },
+                            {
+                              "const": "archive",
+                              "type": "string"
+                            },
+                            {
+                              "const": "trash",
+                              "type": "string"
+                            }
+                          ]
+                        },
+                        "attention": {
+                          "anyOf": [
+                            {
+                              "const": "none",
+                              "type": "string"
+                            },
+                            {
+                              "const": "digest",
+                              "type": "string"
+                            },
+                            {
+                              "const": "wake",
+                              "type": "string"
+                            },
+                            {
+                              "const": "review",
+                              "type": "string"
+                            }
+                          ]
+                        },
+                        "labels": {
+                          "maxItems": 10,
+                          "uniqueItems": true,
+                          "type": "array",
+                          "items": {
+                            "pattern": "^[a-z][a-z0-9_-]{0,63}$",
+                            "type": "string"
+                          }
+                        },
+                        "agentId": {
+                          "minLength": 1,
+                          "maxLength": 128,
+                          "type": "string"
+                        }
+                      }
+                    }
+                  }
+                }
+              },
+              "default": {
+                "additionalProperties": false,
+                "type": "object",
+                "required": [
+                  "disposition",
+                  "attention",
+                  "labels"
+                ],
+                "properties": {
+                  "disposition": {
+                    "anyOf": [
+                      {
+                        "const": "retain",
+                        "type": "string"
+                      },
+                      {
+                        "const": "archive",
+                        "type": "string"
+                      },
+                      {
+                        "const": "trash",
+                        "type": "string"
+                      }
+                    ]
+                  },
+                  "attention": {
+                    "anyOf": [
+                      {
+                        "const": "none",
+                        "type": "string"
+                      },
+                      {
+                        "const": "digest",
+                        "type": "string"
+                      },
+                      {
+                        "const": "wake",
+                        "type": "string"
+                      },
+                      {
+                        "const": "review",
+                        "type": "string"
+                      }
+                    ]
+                  },
+                  "labels": {
+                    "maxItems": 10,
+                    "uniqueItems": true,
+                    "type": "array",
+                    "items": {
+                      "pattern": "^[a-z][a-z0-9_-]{0,63}$",
+                      "type": "string"
+                    }
+                  },
+                  "agentId": {
+                    "minLength": 1,
+                    "maxLength": 128,
+                    "type": "string"
+                  }
+                }
+              },
+              "digestMinutes": {
+                "minimum": 5,
+                "maximum": 10080,
+                "type": "integer"
+              },
+              "quietHours": {
+                "additionalProperties": false,
+                "type": "object",
+                "required": [
+                  "timezone",
+                  "start",
+                  "end"
+                ],
+                "properties": {
+                  "timezone": {
+                    "minLength": 1,
+                    "maxLength": 2000,
+                    "type": "string"
+                  },
+                  "start": {
+                    "minimum": 0,
+                    "maximum": 23,
+                    "type": "integer"
+                  },
+                  "end": {
+                    "minimum": 0,
+                    "maximum": 23,
+                    "type": "integer"
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
     },
     "anyOf": [
-      { "required": ["domains"], "properties": { "domains": { "minItems": 1 } } },
-      { "required": ["senders"], "properties": { "senders": { "minItems": 1 } } }
+      {
+        "required": [
+          "domains"
+        ],
+        "properties": {
+          "domains": {
+            "minItems": 1
+          }
+        }
+      },
+      {
+        "required": [
+          "senders"
+        ],
+        "properties": {
+          "senders": {
+            "minItems": 1
+          }
+        }
+      }
     ]
   },
   "uiHints": {
-    "account": { "label": "Gmail account", "help": "An account already authenticated in this node's gog CLI." },
-    "domains": { "label": "Sender domains", "help": "Exact domains; subdomains are not implicitly included." },
-    "senders": { "label": "Individual senders" },
-    "gogPath": { "label": "gog executable", "advanced": true },
-    "selfAddresses": { "label": "Additional self aliases", "advanced": true }
+    "account": {
+      "label": "Gmail account",
+      "help": "An account already authenticated in this node's gog CLI."
+    },
+    "domains": {
+      "label": "Sender domains",
+      "help": "Exact domains; subdomains are not implicitly included."
+    },
+    "senders": {
+      "label": "Individual senders"
+    },
+    "gogPath": {
+      "label": "gog executable",
+      "advanced": true
+    },
+    "selfAddresses": {
+      "label": "Additional self aliases",
+      "advanced": true
+    }
   }
 }

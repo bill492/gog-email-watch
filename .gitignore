@@ -8,3 +8,6 @@ reports/
 .env
 .env.*
 !.env.example
+tmp/inspect-bill*.mjs
+tmp/bill-*.mjs
+tmp/canary-*

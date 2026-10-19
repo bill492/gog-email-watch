@@ -2,8 +2,8 @@ import { mkdirSync } from "node:fs";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 
-export type MessageStatus = "queued" | "ignored" | "processing" | "done" | "needs_review";
-export type JobStatus = "running" | "replied" | "skipped" | "needs_review";
+export type MessageStatus = "pending" | "queued" | "ignored" | "processing" | "done" | "needs_review" | "shadow" | "digest" | "deferred";
+export type JobStatus = "running" | "replied" | "skipped" | "completed" | "deferred" | "needs_review";
 
 export interface StoredMessage {
   id: string;
@@ -14,6 +14,8 @@ export interface StoredMessage {
   reason: string;
   job_id: string | null;
   discovered: number;
+  attempts: number;
+  due: number;
 }
 
 export interface StoredJob {
@@ -25,6 +27,11 @@ export interface StoredJob {
   created: number;
   finished: number | null;
   reason: string;
+  agent_id: string;
+  session_key: string;
+  run_id: string;
+  evidence_hash: string;
+  policy_version: number;
 }
 
 export class MailState {
@@ -49,7 +56,24 @@ export class MailState {
         target_id TEXT PRIMARY KEY, job_id TEXT NOT NULL, status TEXT NOT NULL,
         updated INTEGER NOT NULL, result TEXT NOT NULL DEFAULT '');
       CREATE INDEX IF NOT EXISTS replies_job ON replies(job_id);
+      CREATE TABLE IF NOT EXISTS policies(version INTEGER PRIMARY KEY, document TEXT NOT NULL, created INTEGER NOT NULL, editor TEXT NOT NULL);
+      CREATE TABLE IF NOT EXISTS assessments(key TEXT PRIMARY KEY, outcome TEXT NOT NULL, created INTEGER NOT NULL);
+      CREATE TABLE IF NOT EXISTS triage(id TEXT PRIMARY KEY, thread_id TEXT NOT NULL, evidence_hash TEXT NOT NULL,
+        assessment_key TEXT NOT NULL, policy_version INTEGER NOT NULL, facts TEXT NOT NULL, plan TEXT NOT NULL,
+        coverage TEXT NOT NULL, historical INTEGER NOT NULL, updated INTEGER NOT NULL);
+      CREATE TABLE IF NOT EXISTS effects(id TEXT PRIMARY KEY, message_id TEXT NOT NULL, status TEXT NOT NULL,
+        intent TEXT NOT NULL, receipt TEXT NOT NULL DEFAULT '', updated INTEGER NOT NULL);
+      CREATE TABLE IF NOT EXISTS reviews(id INTEGER PRIMARY KEY, target TEXT NOT NULL, operation TEXT NOT NULL,
+        note TEXT NOT NULL, actor TEXT NOT NULL, created INTEGER NOT NULL);
     `);
+    // Additive migration: never rewrite prior jobs, receipts, or activation cutoffs.
+    for (const [table, columns] of Object.entries({
+      messages: { attempts: "INTEGER NOT NULL DEFAULT 0", due: "INTEGER NOT NULL DEFAULT 0" },
+      jobs: { agent_id: "TEXT NOT NULL DEFAULT ''", session_key: "TEXT NOT NULL DEFAULT ''", run_id: "TEXT NOT NULL DEFAULT ''", evidence_hash: "TEXT NOT NULL DEFAULT ''", policy_version: "INTEGER NOT NULL DEFAULT 0" },
+    })) {
+      const existing = new Set(this.db.prepare(`PRAGMA table_info(${table})`).all().map(row => row.name));
+      for (const [column, declaration] of Object.entries(columns)) if (!existing.has(column)) this.db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${declaration}`);
+    }
   }
 
   close(): void {

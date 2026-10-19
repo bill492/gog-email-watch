@@ -6,7 +6,7 @@
     "seams": ["plugin-runtime"],
     "sourceRoot": ".",
     "expect": {
-      "registrations": ["registerService", "registerTool", "registerCommand"]
+      "registrations": ["registerService", "registerTool", "registerCommand", "registerGatewayMethod", "registerCli"]
     }
   },
   "capture": { "mockSdk": true }

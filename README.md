@@ -106,7 +106,7 @@ To start in shadow mode, add this to the plugin's `config`:
 
 Install/enable the official `@openclaw/typesafe` plugin with a compatible host
 version, configure its protected SecretRef, and set the mailbox agent's
-`decisionModel` to exactly the same value. This does **not** change its conversation
+`agents.entries.<agentId>.decisionModel` to exactly the same value. This does **not** change its conversation
 model. The plugin checks the selected model before sending evidence and verifies
 provider/model provenance afterward. One provider is used, without fallback.
 Mail content is shared with that configured provider; obtain owner approval first.

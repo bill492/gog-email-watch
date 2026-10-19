@@ -1,7 +1,7 @@
 {
   "id": "gog-email-watch",
   "name": "Gog Email Watch",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "Policy-based inbox triage with review-only maintenance and approved-sender agent workflows.",
   "activation": {
     "onStartup": true

@@ -3,6 +3,7 @@ import { join } from "node:path";
 import { Type } from "@sinclair/typebox";
 import { Value } from "@sinclair/typebox/value";
 import { definePluginEntry, type AnyAgentTool } from "openclaw/plugin-sdk/plugin-entry";
+import { resolveAgentConfig } from "openclaw/plugin-sdk/agent-scope-runtime";
 import { readStringArrayParam, readStringParam } from "openclaw/plugin-sdk/param-readers";
 import { jsonResult } from "openclaw/plugin-sdk/tool-results";
 import { parseConfig } from "./mail.js";
@@ -44,7 +45,8 @@ export default definePluginEntry({
           decisions: api.runtime.decisions,
           decisionModel: () => {
             const current = api.runtime.config.current();
-            return current.agents?.list?.find(agent => agent.id === config.agentId)?.decisionModel ?? current.agents?.defaults?.decisionModel;
+            // The SDK's read-only resolver still types its input as mutable config.
+            return resolveAgentConfig(current as Parameters<typeof resolveAgentConfig>[0], config.agentId)?.decisionModel ?? current.agents?.defaults?.decisionModel;
           },
           logger: ctx.logger,
         });

@@ -8,6 +8,8 @@ import { DatabaseSync } from 'node:sqlite';
 import { GogMailClient, parseConfig, type GmailMessage } from '../src/mail.js';
 import { createMailWorkflow } from '../src/workflow.js';
 import type { DecisionRuntimeV1, DecisionAnswer } from 'openclaw/plugin-sdk/decisions';
+import type { OpenClawPluginApi } from 'openclaw/plugin-sdk/plugin-entry';
+import plugin from '../src/index.js';
 import { defaultPolicy } from '../src/policy.js';
 
 const fakeGog = fileURLToPath(new URL('./fixtures/fake-gog.mjs', import.meta.url));
@@ -145,6 +147,26 @@ function withHarness(fn: (h: {
     rmSync(dir, { recursive: true, force: true });
   });
 }
+
+test('registered service honors the canonical per-agent decision model before inference', async () => withHarness(async (h) => {
+  const provider = assessments();
+  const config = { agents: { defaults: { decisionModel: 'other/wrong' }, entries: { main: { decisionModel: 'typesafe/jev-1.13.0' } } } };
+  let service: Parameters<OpenClawPluginApi['registerService']>[0] | undefined;
+  const api = {
+    pluginConfig: triageConfig(h.config),
+    runtime: { config: { current: () => config }, decisions: provider.decisions, subagent: {} },
+    registerService(value: Parameters<OpenClawPluginApi['registerService']>[0]) { service = value; },
+    registerTool() {}, registerCommand() {}, registerGatewayMethod() {}, registerCli() {},
+  } as unknown as OpenClawPluginApi;
+  plugin.register(api);
+  assert.ok(service);
+  h.setFixture({ ...fixture([message('aa01', 'Please review the estimate')]), probeWritableDb: false });
+  const context = { config: {}, stateDir: h.stateDir, logger: { info() {}, warn() {}, error() {}, debug() {} } };
+  try {
+    await service.start(context);
+    assert.equal(provider.calls(), 1, 'per-agent model must override the different default');
+  } finally { await service.stop?.(context); }
+}));
 
 test('an unreadable thread does not discard healthy discoveries or block their dispatch', async () => withHarness(async (h) => {
   h.setFixture(fixture([]));

@@ -346,6 +346,8 @@ export class GogMailClient {
       const payload = record(row.payload);
       if (payload.headers !== undefined && (!Array.isArray(payload.headers) || !payload.headers.every((header) => {
         const h = record(header);
+        // Gmail may omit the value of an empty header, such as X-MS-TNEF-Correlator.
+        if (typeof h.name === "string" && h.value === undefined) h.value = "";
         return typeof h.name === "string" && typeof h.value === "string";
       }))) throw new Error("unexpected Gmail headers");
       return row as unknown as GmailMessage;

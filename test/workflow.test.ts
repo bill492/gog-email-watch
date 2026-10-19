@@ -42,7 +42,7 @@ function message(id: string, body: string, options: {
 
 type Fixture = {
   search: { messages: Array<{ id: string; threadId: string }> };
-  threads: Record<string, { thread: { id: string; messages: GmailMessage[] } }>;
+  threads: Record<string, { thread: { id: string; messages: unknown[] } }>;
   send?: { id: string };
   sendFailure?: boolean;
   probeWritableDb?: boolean;
@@ -227,7 +227,16 @@ test('new mail uses full chronological thread and a stable session, then sends o
   };
   workflow = createMailWorkflow({ config: h.config, stateDir: h.stateDir, subagent });
   await workflow.start();
-  h.setFixture(fixture([incoming, external, old, sent], [incoming]));
+  const pollFixture = fixture([incoming, external, old, sent], [incoming]);
+  // Gmail can omit the value of an empty header in an otherwise valid thread.
+  pollFixture.threads.bb01!.thread.messages[0] = {
+    ...incoming,
+    payload: {
+      ...incoming.payload,
+      headers: [...(incoming.payload.headers ?? []), { name: 'X-MS-TNEF-Correlator' }],
+    },
+  };
+  h.setFixture(pollFixture);
   await workflow.poll();
   await waitFor(() => workflow.status().jobs.replied === 1);
   assert.equal(runs.length, 1);

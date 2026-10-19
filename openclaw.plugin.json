@@ -1,7 +1,7 @@
 {
   "id": "gog-email-watch",
   "name": "Gog Email Watch",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Poll Gmail through the existing gog CLI and dispatch approved mail to an OpenClaw agent.",
   "activation": { "onStartup": true },
   "contracts": { "tools": ["gog_email_reply", "gog_email_skip"] },

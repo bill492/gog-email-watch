@@ -39,5 +39,9 @@ an already-published version only when its tarball integrity matches exactly.
 5. Wait for the Release workflow; verify the npm version and integrity, and that
    the tag references the intended commit. A failed npm job is not a completed release.
 
+To retry an existing tag with the current release workflow (for example, after
+repairing publication infrastructure), run `gh workflow run release.yml -f tag=vX.Y.Z`.
+This does not move the tag or change its package; the same version/integrity checks apply.
+
 The workflow publishes `latest` for normal releases and `next` for prereleases.
 Releasing never installs on fleet nodes or replaces an existing email watcher.

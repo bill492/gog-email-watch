@@ -248,9 +248,17 @@
             "type": "number"
           },
           "reconcileLookbackSeconds": {
-            "minimum": 0,
-            "default": 604800,
-            "type": "number"
+            "default": null,
+            "description": "Reconciliation lookback; null covers the rolling age window in triage (all Inbox mail if maxAgeDays is null), or seven days in responder mode. Explicit numbers override it.",
+            "anyOf": [
+              {
+                "minimum": 0,
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ]
           },
           "maxAgeDays": {
             "default": 30,
@@ -328,6 +336,23 @@
         "required": [
           "triage"
         ]
+      },
+      {
+        "required": [
+          "settings"
+        ],
+        "properties": {
+          "settings": {
+            "required": [
+              "wakeFrom"
+            ],
+            "properties": {
+              "wakeFrom": {
+                "minItems": 1
+              }
+            }
+          }
+        }
       }
     ]
   },

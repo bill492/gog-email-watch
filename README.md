@@ -444,10 +444,15 @@ host/provider/platform constraints.
 | `gogMaxOutputBytes` | Integer >= 1; `10485760` (10 MiB) | Maximum buffered output from each gog subprocess. |
 | `discoveryOverlapSeconds` | Number >= 0; `600` | New-mail discovery overlap behind the previous poll. |
 | `reconcileIntervalSeconds` | Number > 0; `3600` | Interval between wider new-mail discovery checks. |
-| `reconcileLookbackSeconds` | Number >= 0; `604800` (7 days) | Lookback for those checks, bounded by the rolling age window and sender activation in responder mode. |
+| `reconcileLookbackSeconds` | Number >= 0 or `null`; `null` | By default, covers the full rolling age window in triage (all Inbox mail when `maxAgeDays` is `null`), or 7 days in responder mode. A number explicitly overrides the lookback; age and responder activation cutoffs still apply. |
 | `maxAgeDays` | Number > 0 or `null`; `30` | Skip older messages before inference, labels and wakes. `null` disables the age rule. Historical deletion scans are exempt. |
 | `maxInputTokens` | Integer >= 1; `32000` | Estimated tokens for state plus the largest question. Oversized conversation content drops oldest messages first, retaining the newest. |
 | `maxRequestTokens` | Integer >= 1; `64000` | Estimated tokens for state plus all questions, including a multi-label request. Prompt and label definitions are never truncated. |
+
+On upgrade, saved seven-day defaults inherit the rolling window. Numeric file
+settings and detectable live lookback edits are preserved. Older versions left
+no evidence when a live edit merely repeated the seven-day default; set that
+number explicitly again if the shorter window was intentional.
 
 For example, read the current version and then call:
 

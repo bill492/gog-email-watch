@@ -21,7 +21,7 @@ export const SettingsSchema = Type.Partial(Type.Object({
   gogMaxOutputBytes: Type.Integer({ minimum: 1, default: 10 * 1024 * 1024 }),
   discoveryOverlapSeconds: Type.Number({ minimum: 0, default: 600 }),
   reconcileIntervalSeconds: Type.Number({ exclusiveMinimum: 0, default: 3600 }),
-  reconcileLookbackSeconds: Type.Number({ minimum: 0, default: 7 * 86400 }),
+  reconcileLookbackSeconds: Type.Union([Type.Number({ minimum: 0 }), Type.Null()], { default: null, description: "Reconciliation lookback; null covers the rolling age window in triage (all Inbox mail if maxAgeDays is null), or seven days in responder mode. Explicit numbers override it." }),
   maxAgeDays: Type.Union([Type.Number({ exclusiveMinimum: 0 }), Type.Null()], { default: 30, description: "Skip older messages before inference or waking. Rolling Gmail timestamp cutoff; null disables. Explicit historical deletion scans are exempt." }),
   maxInputTokens: Type.Integer({ minimum: 1, default: 32_000, description: "Estimated state plus largest question token budget. Trim oldest conversation content first; never trim policy." }),
   maxRequestTokens: Type.Integer({ minimum: 1, default: 64_000, description: "Estimated state plus all questions token budget, including independent labels." }),
@@ -39,7 +39,7 @@ export const defaultSettings: StoredSettings = {
   wakePrompt: "", responderPrompt: "", pollIntervalSeconds: 120, concurrency: 50, labelConcurrency: null,
   retryDelaySeconds: null, decisionTimeoutSeconds: 30, gogTimeoutSeconds: 90, agentWaitTimeoutSeconds: 660,
   gogMaxOutputBytes: 10 * 1024 * 1024, discoveryOverlapSeconds: 600, reconcileIntervalSeconds: 3600,
-  reconcileLookbackSeconds: 7 * 86400, maxAgeDays: 30, maxInputTokens: 32_000, maxRequestTokens: 64_000,
+  reconcileLookbackSeconds: null, maxAgeDays: 30, maxInputTokens: 32_000, maxRequestTokens: 64_000,
 };
 export function parseSettings(value: unknown): SettingsPatch {
   if (!Value.Check(SettingsSchema, value)) throw new Error("invalid email runtime settings");
@@ -154,7 +154,9 @@ export function createPolicyStore(config: MailConfig, state: MailState) {
   const policyChanged = config.triage && state.meta("triage_config_policy") !== policyHash;
   const threadMigration = config.triage && state.meta("triage_unit") !== "rolling-thread";
   // Recognize the old file fingerprint without resetting persisted live overrides.
-  const { replyAllowed: _reply, agentConcurrency: _agents, wakeFrom: _wakeFrom, ...v036Settings } = configuredSettings;
+  const { replyAllowed: _reply, agentConcurrency: _agents, wakeFrom: _wakeFrom, ...v036Settings } = {
+    ...configuredSettings, reconcileLookbackSeconds: config.settings?.reconcileLookbackSeconds === undefined ? 7 * 86400 : config.settings.reconcileLookbackSeconds,
+  };
   const { maxAgeDays: _age, maxInputTokens: _input, maxRequestTokens: _request, ...previousSettings } = v036Settings;
   const legacySettingsHash = hash({ ...previousSettings, evidence: { maxBytes: 16_000, context: "thread", ...config.settings?.evidence } });
   const newOverrides = ["maxAgeDays", "maxInputTokens", "maxRequestTokens"].some(key => key in (config.settings ?? {}));
@@ -163,11 +165,20 @@ export function createPolicyStore(config: MailConfig, state: MailState) {
     (oldFingerprint === hash(v036Settings) || (!newOverrides &&
       (oldFingerprint === hash(previousSettings) || oldFingerprint === legacySettingsHash)));
   const settingsChanged = oldFingerprint !== settingsHash && !unchangedLegacySettings;
-  if (!validPrevious || policyChanged || settingsChanged || threadMigration) state.transaction(() => {
+  // Old snapshots materialized the seven-day default. Upgrade implicit defaults,
+  // but retain numeric file choices and any detectable live lookback edits.
+  // A live write equal to the old default left no distinguishable evidence.
+  const inheritLookback = validPrevious && config.settings?.reconcileLookbackSeconds === undefined &&
+    read().settings.reconcileLookbackSeconds === 7 * 86400 && !state.db.prepare(`SELECT 1 FROM (
+      SELECT editor,json_extract(settings,'$.reconcileLookbackSeconds') AS lookback,
+        lag(json_extract(settings,'$.reconcileLookbackSeconds')) OVER (ORDER BY version) AS previous FROM policies
+    ) WHERE editor!='plugin-config' AND lookback IS NOT previous LIMIT 1`).get();
+  if (!validPrevious || policyChanged || settingsChanged || threadMigration || inheritLookback) state.transaction(() => {
     const previous = validPrevious ? read() : undefined;
     const next = { version: (row?.version ?? 0) + 1,
       document: (policyChanged && config.triage?.policy !== undefined) || !previous ? configured : previous.document,
-      settings: settingsChanged || !previous ? configuredSettings : previous.settings };
+      settings: settingsChanged || !previous ? configuredSettings :
+        inheritLookback ? { ...previous.settings, reconcileLookbackSeconds: null } : previous.settings };
     save(next, "plugin-config");
     replan(threadMigration ? undefined : previous, next);
     if (config.triage) state.setMeta("triage_config_policy", policyHash);

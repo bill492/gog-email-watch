@@ -178,6 +178,9 @@ export function createMailWorkflow(options: WorkflowOptions) {
       state.db.prepare("UPDATE messages SET status='failed',reason='worker interrupted' WHERE status='processing' AND job_id IN (SELECT id FROM jobs WHERE status='interrupted')").run();
       state.db.prepare("UPDATE messages SET status='needs_review',reason='worker interrupted' WHERE status='processing' AND job_id IN (SELECT id FROM jobs WHERE status='needs_review')").run();
       state.db.prepare("UPDATE messages SET status='done' WHERE status='processing' AND job_id IN (SELECT id FROM jobs WHERE status IN ('replied','skipped','completed'))").run();
+      // Older versions acknowledged deferral before their run finalizer moved
+      // the children. Preserve its persisted due time and already-sent replies.
+      state.db.prepare("UPDATE messages SET status='deferred' WHERE status='processing' AND job_id IN (SELECT id FROM jobs WHERE status='deferred')").run();
     });
   }
 
@@ -249,7 +252,8 @@ export function createMailWorkflow(options: WorkflowOptions) {
       const reconcile = now - Number(state.meta("last_reconcile") ?? 0) >= settings.reconcileIntervalSeconds;
       const earliest = triage ? Math.floor(oldest / 1000) : since - 1;
       let after = Math.max(earliest, Math.floor(lastPoll - settings.discoveryOverlapSeconds));
-      if (reconcile) after = Math.min(after, Math.max(earliest, Math.floor(now - settings.reconcileLookbackSeconds)));
+      const lookback = settings.reconcileLookbackSeconds ?? (triage ? (settings.maxAgeDays === null ? now : settings.maxAgeDays * 86400) : 7 * 86400);
+      if (reconcile) after = Math.min(after, Math.max(earliest, Math.floor(now - lookback)));
       // Finish discovery before any deletes can alter Gmail pagination.
       await withMailbox("discovery", async () => {
         if (triage && !state.meta("triage_discovered")) {
@@ -566,7 +570,7 @@ Use gog_email_context for the authorized job snapshot. If work is finished witho
         const status = done ? current.status : "needs_review";
         const reason = done ? current.reason : (error || "agent did not call reply or skip");
         state.db.prepare("UPDATE jobs SET status=?,finished=?,reason=? WHERE id=?").run(status, seconds(), reason, job.id);
-        state.db.prepare("UPDATE messages SET status=?,reason=? WHERE job_id=?").run(current.status === "deferred" ? "deferred" : done ? "done" : "needs_review", reason, job.id);
+        state.db.prepare("UPDATE messages SET status=?,reason=? WHERE job_id=? AND status='processing'").run(current.status === "deferred" ? "deferred" : done ? "done" : "needs_review", reason, job.id);
         state.setMeta("last_worker", seconds());
       });
       logger?.info(`gog-email-watch: job ${job.id} finished: ${state.job(job.id)?.status}`);
@@ -702,7 +706,8 @@ ${policies.settings().wakePrompt}`.trimEnd(), ["gog_email_reply", "gog_email_con
         throw new Error("defer time must be a future Unix timestamp in seconds");
       const status = deferUntil === undefined ? "completed" : "deferred";
       state.db.prepare("UPDATE jobs SET status=?,reason=? WHERE id=?").run(status, input.reason, job.id);
-      if (deferUntil !== undefined) state.db.prepare("UPDATE messages SET due=? WHERE job_id=? AND status='processing'").run(deferUntil, job.id);
+      state.db.prepare("UPDATE messages SET status=?,reason=?,due=? WHERE job_id=? AND status='processing'")
+        .run(deferUntil === undefined ? "done" : "deferred", input.reason, deferUntil ?? 0, job.id);
       return { status, job: job.id, due: deferUntil };
     });
   }

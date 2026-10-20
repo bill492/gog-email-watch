@@ -5,6 +5,7 @@ import { join } from 'node:path';
 import { test } from 'node:test';
 import { fileURLToPath } from 'node:url';
 import { DatabaseSync } from 'node:sqlite';
+import { Ajv } from 'ajv';
 import { GogMailClient, parseConfig, type GmailMessage } from '../src/mail.js';
 import { createMailWorkflow, type MailSubagent, type WorkflowOptions } from '../src/workflow.js';
 import type { DecisionRuntimeV1, DecisionAnswer } from 'openclaw/plugin-sdk/decisions';
@@ -15,6 +16,23 @@ import { defaultPolicy } from '../src/policy.js';
 const fakeGog = fileURLToPath(new URL('./fixtures/fake-gog.mjs', import.meta.url));
 const account = 'agent@example.com';
 const approved = 'bek@example.com';
+
+test('manifest admits wakeFrom-only installs and rejects an empty selection', () => {
+  const manifest = JSON.parse(readFileSync(new URL('../openclaw.plugin.json', import.meta.url), 'utf8'));
+  const validate = new Ajv({ strict: false }).compile(manifest.configSchema);
+  for (const selection of [{ settings: { wakeFrom: ['example.com'] } }, { domains: ['example.com'] },
+    { senders: [approved] }, { triage: { decisionModel: 'typesafe/jev-1.13.0' } }]) {
+    const config = { account, ...selection };
+    assert.doesNotThrow(() => parseConfig(config));
+    assert.equal(validate(config), true, JSON.stringify(validate.errors));
+  }
+  for (const selection of [{}, { settings: {} }, { settings: { wakeFrom: [] } },
+    { domains: [], senders: [], settings: { wakeFrom: [] } }]) {
+    const config = { account, ...selection };
+    assert.throws(() => parseConfig(config), /configure at least one/);
+    assert.equal(validate(config), false);
+  }
+});
 
 function message(id: string, body: string, options: {
   sender?: string;
@@ -468,6 +486,7 @@ test('live settings reschedule polling, tune discovery and survive restarts with
   const searches = () => h.calls().filter(args => args.includes('search'));
   try {
     await workflow.start();
+    assert.ok(searches().at(-1)!.some(arg => arg.includes(`after:${workflow.status().activeSince - 1} `)), 'responder discovery never precedes activation');
     workflow.policyUpdate(undefined, 1, 'main', { pollIntervalSeconds: 1, concurrency: 7,
       discoveryOverlapSeconds: 20, reconcileIntervalSeconds: 100, reconcileLookbackSeconds: 200 });
     assert.equal(workflow.policyGet().settings.labelConcurrency, 7);
@@ -505,6 +524,54 @@ test('live settings reschedule polling, tune discovery and survive restarts with
     assert.equal(workflow.policyGet().settings.responderPrompt, 'File override');
   } finally { await workflow.stop(); }
 }));
+
+test('reconciliation finds mail moved into Inbox across the rolling window and preserves explicit lookbacks', async t => {
+  const cases: Array<{ maxAgeDays: number | null; fileLookback?: number; liveLookbacks?: number[] }> = [
+    { maxAgeDays: 30 }, { maxAgeDays: 60 }, { maxAgeDays: null },
+    { maxAgeDays: 30, fileLookback: 0 }, { maxAgeDays: 30, fileLookback: 604800 },
+    { maxAgeDays: 30, liveLookbacks: [600] }, { maxAgeDays: 30, liveLookbacks: [600, 604800] },
+  ];
+  for (const testCase of cases) await t.test(JSON.stringify(testCase), async sub => withHarness(async h => {
+    const { maxAgeDays, fileLookback, liveLookbacks } = testCase;
+    sub.mock.timers.enable({ apis: ['Date'], now: Date.now() });
+    const received = Date.now() - (maxAgeDays === 30 ? 20 : 40) * 86400000;
+    const target = message('aa01', 'Moved back to Inbox', { received });
+    target.labelIds = [];
+    h.setFixture(fixture([target]));
+    const config = triageConfig({ ...h.config, settings: { maxAgeDays,
+      ...(fileLookback === undefined ? {} : { reconcileLookbackSeconds: fileLookback }) } });
+    const provider = assessments();
+    const mail = new GogMailClient(config), search = mail.searchPage.bind(mail);
+    // The fake CLI checks Inbox membership; this adds Gmail's timestamp filter.
+    mail.searchPage = async (after, ...rest) => {
+      const result = await search(after, ...rest);
+      return { ...result, messages: received / 1000 > after ? result.messages : [] };
+    };
+    let workflow = createMailWorkflow({ config, stateDir: h.stateDir, mail, ...provider,
+      subagent: { run: async () => { throw new Error('queue is not due'); }, waitForRun: async () => ({ status: 'ok' }) } });
+    try {
+      await workflow.start();
+      assert.equal(workflow.inspect().length, 0);
+      for (const lookback of liveLookbacks ?? [])
+        workflow.policyUpdate(undefined, workflow.policyGet().version, 'main', { reconcileLookbackSeconds: lookback });
+      await workflow.stop();
+      // The previous version stored all defaults, including its seven-day
+      // lookback. An unchanged file must not keep that accidental limitation.
+      const legacy = h.db();
+      legacy.prepare("UPDATE policies SET settings=json_set(settings,'$.reconcileLookbackSeconds',604800) WHERE json_extract(settings,'$.reconcileLookbackSeconds') IS NULL").run();
+      legacy.close();
+      target.labelIds = ['INBOX']; h.setFixture(fixture([target]));
+      sub.mock.timers.setTime(Date.now() + 3600000);
+      workflow = createMailWorkflow({ config, stateDir: h.stateDir, mail, ...provider,
+        subagent: { run: async () => { throw new Error('queue is not due'); }, waitForRun: async () => ({ status: 'ok' }) } });
+      await workflow.start(); await waitFor(() => !workflow.status().triage!.labeling);
+      const explicitLookback = fileLookback ?? liveLookbacks?.at(-1);
+      assert.equal(workflow.policyGet().configuredSettings.reconcileLookbackSeconds, explicitLookback ?? null);
+      assert.equal(workflow.inspect('aa01')[0]?.message.status, explicitLookback === undefined ? 'queue' : undefined);
+      assert.equal(provider.calls(), explicitLookback === undefined ? 1 : 0, 'only mail inside the selected discovery window is classified');
+    } finally { await workflow.stop(); }
+  }));
+});
 
 test('retry deadlines and timeout overrides survive restart without replaying queued chains', async t => withHarness(async h => {
   t.mock.timers.enable({ apis: ['Date'], now: new Date(2026, 9, 19, 12).getTime() });
@@ -902,6 +969,7 @@ test('triage replies honor the live toggle, send per conversation and defer only
   const provider = assessments(() => ({ action: { type: 'choice', choice: 'wake', probabilities: {} } }));
   const config = triageConfig({ ...h.config, settings: { replyAllowed: false } });
   let workflow: ReturnType<typeof createMailWorkflow>, runs = 0, checks = 0;
+  let acknowledged: Record<string, number> | undefined;
   const mail = new GogMailClient(config), getThread = mail.getThread.bind(mail);
   let disableDuringRead = false;
   mail.getThread = async id => {
@@ -943,6 +1011,7 @@ test('triage replies honor the live toggle, send per conversation and defer only
         await assert.rejects(workflow.reply({ ...reply, threadId: 'bb01' }), /duplicate/);
         assert.equal(workflow.context(jobId, sessionKey).messages.find(row => row.threadId === 'bb01')?.replyStatus, 'sent');
         workflow.complete({ jobId, sessionKey, reason: 'Two replies sent; third needs follow-up' }, Math.floor(Date.now() / 1000) + 60);
+        acknowledged = workflow.status().messages;
       } else {
         assert.deepEqual(workflow.context(jobId, sessionKey).messages.flatMap(row => row.messageIds), ['aa03']);
         await workflow.reply(reply); // One conversation needs no selector.
@@ -956,8 +1025,19 @@ test('triage replies honor the live toggle, send per conversation and defer only
   try {
     await workflow.start(); await waitFor(() => !workflow.status().working);
     assert.equal(checks, 1, JSON.stringify(workflow.status().unresolvedJobs));
+    assert.deepEqual(acknowledged, { deferred: 1, done: 2 }, 'acknowledgment persists unfinished mail before the run ends');
     assert.deepEqual(workflow.status().messages, { deferred: 1, done: 2 });
     assert.equal(provider.calls(), 3, 'reply toggle does not reclassify mail');
+    await workflow.stop();
+    // State left by older versions crashing after defer acknowledgment but
+    // before their run finalizer. Already-replied conversations stay done.
+    const legacy = h.db();
+    legacy.prepare("UPDATE messages SET status='processing' WHERE status='deferred'").run();
+    legacy.close();
+    workflow = createMailWorkflow({ config, stateDir: h.stateDir, ...provider, subagent });
+    await workflow.start();
+    assert.deepEqual(workflow.status().messages, { deferred: 1, done: 2 });
+    assert.equal(checks, 1, 'restart must not resume before the explicit time');
     await workflow.stop();
     t.mock.timers.setTime(Date.now() + 60000);
     workflow = createMailWorkflow({ config, stateDir: h.stateDir, ...provider, subagent });
@@ -1412,32 +1492,54 @@ test('only authorized human mail dispatches; unreadable threads retry after rest
   } finally { await workflow.stop(); }
 }));
 
-test('deferred responder resumes once when due', async t => withHarness(async h => {
+test('deferred responder waits for its active run, resumes once when due and repairs old acknowledgments', async t => withHarness(async h => {
   t.mock.timers.enable({ apis: ['Date'], now: Date.now() });
   h.setFixture(fixture([]));
   const config = h.config;
   let workflow: ReturnType<typeof createMailWorkflow>, runs = 0;
+  let acknowledgedStatus: string | undefined;
+  let release!: () => void, waits = 0;
+  const firstRun = new Promise<void>(resolve => { release = resolve; });
   const subagent: MailSubagent = {
     run: async ({ sessionKey, message: prompt }: { sessionKey: string; message: string }) => {
       runs++;
       const jobId = /Job ID: ([a-f0-9]{24})/.exec(prompt)![1];
-      if (runs === 1) workflow.complete({ jobId, sessionKey, reason: 'Waiting for scheduled check' }, Math.floor(Date.now() / 1000) + 3600);
+      if (runs < 3) {
+        workflow.complete({ jobId, sessionKey, reason: 'Waiting for scheduled check' }, Math.floor(Date.now() / 1000) + 3600);
+        if (runs === 1) acknowledgedStatus = workflow.inspect('aa01')[0].message.status;
+      }
       else workflow.complete({ jobId, sessionKey, reason: 'Completed' });
       return { runId: jobId, sessionKey };
-    }, waitForRun: async () => ({ status: 'ok' }),
+    }, waitForRun: async () => { if (++waits === 1) await firstRun; return { status: 'ok' }; },
   };
   workflow = createMailWorkflow({ config, stateDir: h.stateDir, subagent });
   try {
     await workflow.start(); h.setFixture(fixture([message('aa01', 'Please help')]));
-    await workflow.poll(); await waitFor(() => !workflow.status().working);
+    await workflow.poll(); await waitFor(() => acknowledgedStatus !== undefined);
+    assert.equal(acknowledgedStatus, 'deferred', 'defer is durable before the run ends');
     assert.equal(workflow.status().messages.deferred, 1);
     t.mock.timers.setTime(Date.now() + 3599000);
-    await workflow.poll(); await waitFor(() => !workflow.status().working);
+    await workflow.poll();
     assert.equal(runs, 1, 'must not resume early');
     t.mock.timers.setTime(Date.now() + 1000);
+    await workflow.poll();
+    assert.equal(runs, 1, 'a due retry cannot overlap its still-active predecessor');
+    release(); await waitFor(() => !workflow.status().working);
+    assert.equal(runs, 2, 'the predecessor finalizer must not overwrite the due retry');
+    await workflow.stop();
+    const legacy = h.db();
+    legacy.prepare("UPDATE messages SET status='processing' WHERE status='deferred'").run();
+    legacy.close();
+    workflow = createMailWorkflow({ config, stateDir: h.stateDir, subagent });
+    await workflow.start();
+    assert.equal(workflow.status().messages.deferred, 1, 'restart repairs legacy acknowledged deferrals');
+    t.mock.timers.setTime(Date.now() + 3599000);
     await workflow.poll(); await waitFor(() => !workflow.status().working);
-    assert.equal(runs, 2); assert.equal(workflow.status().jobs.completed, 1);
-  } finally { await workflow.stop(); }
+    assert.equal(runs, 2, 'restart must retain the second deferral deadline');
+    t.mock.timers.setTime(Date.now() + 1000);
+    await workflow.poll(); await waitFor(() => !workflow.status().working);
+    assert.equal(runs, 3); assert.equal(workflow.status().jobs.completed, 1);
+  } finally { release(); await workflow.stop(); }
 }));
 
 test('deferred daily queue resumes together at the explicit time after restart', async t => withHarness(async h => {

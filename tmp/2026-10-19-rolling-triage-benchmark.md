@@ -1,8 +1,8 @@
 # Rolling inbox triage and token trimming
 
 Date: 2026-10-19 (America/New_York).
-Status: implementation and review fixes prepared for v0.3.5. The results below
-precede release and rollout; deployment verification is recorded separately.
+Status: released as v0.3.5 and installed on Bill, still paused. The results below
+precede release and rollout; see the [deployment verification](2026-10-19-v035-release-and-bill-rollout.md).
 
 ## Behavior
 

@@ -1,7 +1,7 @@
 {
   "id": "gog-email-watch",
   "name": "Gog Email Watch",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "description": "Old-mail wake/queue/delete triage, independent labels and approved-sender responses.",
   "activation": {
     "onStartup": true

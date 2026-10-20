@@ -784,6 +784,9 @@ test('a large old-mail cycle drains all pages with configured concurrency, one w
   try {
     await waitFor(() => calls >= 50); release();
     await started; await waitFor(() => !workflow.status().working);
+    // Real Gmail treats after:0 as an empty result, not an unbounded search.
+    assert.ok(h.calls().filter(args => args.includes('search')).every(args =>
+      !args[args.indexOf('search') + 1].split(/\s+/).includes('after:0')));
     assert.equal(peak, 50); assert.equal(calls, 251);
     assert.equal(wakes.length, 1); assert.equal(wakes[0].length, 251);
     assert.deepEqual(workflow.status().messages, { done: 251 });

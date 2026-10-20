@@ -352,7 +352,7 @@ export class GogMailClient {
       ...this.config.senders.map((sender) => `from:${sender}`),
     ];
     if (scope === "approved" && !senders.length) return { messages: [] };
-    const query = `after:${afterSeconds} ${beforeSeconds === undefined ? "" : `before:${beforeSeconds}`} ${scope === "all" ? "" : scope === "inbox" ? "in:inbox" : `{${senders.join(" ")}}`} -in:spam -in:trash -in:sent -in:drafts`;
+    const query = `${afterSeconds ? `after:${afterSeconds}` : ""} ${beforeSeconds === undefined ? "" : `before:${beforeSeconds}`} ${scope === "all" ? "" : scope === "inbox" ? "in:inbox" : `{${senders.join(" ")}}`} -in:spam -in:trash -in:sent -in:drafts`;
     const data = record(await this.gog(["gmail", "messages", "search", query, "--max", "100", ...(page ? ["--page", page] : [])]));
     if (!Array.isArray(data.messages)) throw new Error("unexpected Gmail search response");
     const messages = data.messages.map((item) => {

@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { promisify } from "node:util";
 import emailAddresses from "email-addresses";
-import { parseTriage, type Facts, type TriageConfig } from "./policy.js";
+import { defaultSettings, effectiveSettings, parseSettings, parseTriage, type Facts, type RuntimeSettings, type SettingsPatch, type TriageConfig } from "./policy.js";
 
 const run = promisify(execFile);
 const excludedLabels = new Set(["SPAM", "TRASH", "SENT", "DRAFT"]);
@@ -20,6 +20,7 @@ export interface MailConfig {
   gogPath: string;
   selfAddresses: string[];
   triage?: TriageConfig;
+  settings?: SettingsPatch;
 }
 
 export interface GmailMessage {
@@ -110,7 +111,7 @@ export function parseConfig(value: unknown): MailConfig {
     throw new Error("invalid sender domain");
   }
   const senders = addressList(raw.senders ?? [], "senders");
-  if (!domains.length && !senders.length) throw new Error("configure at least one domain or sender");
+  if (!domains.length && !senders.length && !raw.triage) throw new Error("configure at least one domain or sender, or enable triage");
   const selfAddresses = [...new Set([account, ...addressList(raw.selfAddresses ?? [], "selfAddresses")])];
   const agentId = raw.agentId ?? "main";
   const pollIntervalSeconds = raw.pollIntervalSeconds ?? 120;
@@ -120,7 +121,7 @@ export function parseConfig(value: unknown): MailConfig {
     throw new Error("pollIntervalSeconds must be a positive integer");
   }
   if (typeof gogPath !== "string" || !gogPath.trim()) throw new Error("gogPath must be nonempty");
-  return { account, domains, senders, agentId, pollIntervalSeconds, gogPath, selfAddresses, triage: parseTriage(raw.triage, agentId) };
+  return { account, domains, senders, agentId, pollIntervalSeconds, gogPath, selfAddresses, triage: parseTriage(raw.triage), settings: parseSettings(raw.settings ?? {}) };
 }
 
 function headers(message: GmailMessage | { payload: GmailPart }): Map<string, string[]> {
@@ -327,13 +328,17 @@ export function plainTextToHtml(text: string): string {
 }
 
 export class GogMailClient {
-  constructor(private readonly config: MailConfig, private readonly signal?: AbortSignal) {}
+  private readonly labelLookups = new Map<string, Promise<string>>();
+  constructor(private readonly config: MailConfig, private readonly signal?: AbortSignal,
+    private readonly settings: () => RuntimeSettings = () => effectiveSettings({ ...defaultSettings, ...config.settings,
+      evidence: { ...defaultSettings.evidence, ...config.settings?.evidence } })) {}
 
-  private async gog(args: string[], timeout = 90_000): Promise<unknown> {
+  private async gog(args: string[]): Promise<unknown> {
+    const settings = this.settings();
     const command = ["--account", this.config.account, "--no-input", "--json", ...args];
     let stdout: string;
     try {
-      ({ stdout } = await run(this.config.gogPath, command, { timeout, maxBuffer: 10 * 1024 * 1024, encoding: "utf8", signal: this.signal }));
+      ({ stdout } = await run(this.config.gogPath, command, { timeout: Math.ceil(settings.gogTimeoutSeconds * 1000), maxBuffer: settings.gogMaxOutputBytes, encoding: "utf8", signal: this.signal }));
     } catch (error) {
       const code = error && typeof error === "object" && "code" in error ? String(error.code) : "unknown";
       throw new Error(`gog command failed (${code}); check CLI authentication and availability`);
@@ -342,13 +347,15 @@ export class GogMailClient {
     catch { throw new Error("gog returned invalid JSON"); }
   }
 
-  async searchPage(afterSeconds: number, page?: string, scope: "approved" | "inbox" = this.config.triage?.wakeOnExternalReplies ? "inbox" : this.config.triage?.observe ?? "approved"): Promise<{ messages: SearchMessage[]; nextPageToken?: string }> {
+  async searchPage(afterSeconds: number, page?: string, scope: "approved" | "inbox" | "all" = this.config.triage?.wakeOnExternalReplies ? "inbox" : "approved", beforeSeconds?: number): Promise<{ messages: SearchMessage[]; nextPageToken?: string }> {
     if (!Number.isInteger(afterSeconds) || afterSeconds < 0) throw new Error("invalid search cutoff");
+    if (beforeSeconds !== undefined && (!Number.isInteger(beforeSeconds) || beforeSeconds <= afterSeconds)) throw new Error("invalid search end date");
     const senders = [
       ...this.config.domains.map((domain) => `from:(@${domain})`),
       ...this.config.senders.map((sender) => `from:${sender}`),
     ];
-    const query = `after:${afterSeconds} ${scope === "inbox" ? "in:inbox" : `{${senders.join(" ")}}`} -in:spam -in:trash -in:sent -in:drafts`;
+    if (scope === "approved" && !senders.length) return { messages: [] };
+    const query = `after:${afterSeconds} ${beforeSeconds === undefined ? "" : `before:${beforeSeconds}`} ${scope === "all" ? "" : scope === "inbox" ? "in:inbox" : `{${senders.join(" ")}}`} -in:spam -in:trash -in:sent -in:drafts`;
     const data = record(await this.gog(["gmail", "messages", "search", query, "--max", "100", ...(page ? ["--page", page] : [])]));
     if (!Array.isArray(data.messages)) throw new Error("unexpected Gmail search response");
     const messages = data.messages.map((item) => {
@@ -398,20 +405,29 @@ export class GogMailClient {
     return { id, messages };
   }
 
-  async labelId(suffix: string): Promise<string> {
-    if (!/^[a-z][a-z0-9_-]{0,63}$/.test(suffix)) throw new Error("invalid plugin label");
-    const name = `Gog/${suffix}`;
+  labelId(name: string): Promise<string> {
+    let lookup = this.labelLookups.get(name);
+    if (!lookup) {
+      // Coalesce concurrent lookups only. Gmail IDs change on label recreation.
+      lookup = this.findLabel(name).finally(() => { this.labelLookups.delete(name); });
+      this.labelLookups.set(name, lookup);
+    }
+    return lookup;
+  }
+
+  private async findLabel(name: string): Promise<string> {
     const data = record(await this.gog(["gmail", "labels", "list"]));
     if (!Array.isArray(data.labels)) throw new Error("invalid Gmail labels response");
     const found = data.labels.map(record).find(label => label.name === name);
     const label = found ?? record(record(await this.gog(["gmail", "labels", "create", name])).label);
-    if (typeof label.id !== "string" || !/^Label_[A-Za-z0-9_-]+$/.test(label.id)) throw new Error("invalid plugin label ID");
+    if (typeof label.id !== "string" || !label.id) throw new Error("invalid Gmail label ID");
+    if (["INBOX", "SPAM", "TRASH", "SENT", "DRAFT"].includes(label.id))
+      throw new Error(`Gmail mailbox-state label ${name} cannot be used as a category`);
     return label.id;
   }
 
   async modify(ids: string[], add: string[], remove: string[]): Promise<unknown> {
-    if (!ids.length || ids.length > 100 || ids.some(id => !isGmailId(id))) throw new Error("invalid mutation targets");
-    if (add.some(id => !/^Label_[A-Za-z0-9_-]+$/.test(id) && id !== "TRASH") || remove.some(id => id !== "INBOX")) throw new Error("invalid mailbox mutation");
+    if (!ids.length || ids.some(id => !isGmailId(id))) throw new Error("invalid mutation targets");
     const result = record(await this.gog(["gmail", "batch", "modify", ...ids, ...(add.length ? ["--add", add.join(",")] : []), ...(remove.length ? ["--remove", remove.join(",")] : [])]));
     if (!Array.isArray(result.modified) || result.modified.length !== ids.length || !ids.every(id => (result.modified as unknown[]).includes(id))) throw new Error("mailbox mutation acknowledgment uncertain");
     return { modified: ids, addedLabels: add, removedLabels: remove };

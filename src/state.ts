@@ -2,8 +2,8 @@ import { mkdirSync } from "node:fs";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 
-export type MessageStatus = "pending" | "queued" | "ignored" | "processing" | "done" | "needs_review" | "shadow" | "digest" | "deferred";
-export type JobStatus = "running" | "replied" | "skipped" | "completed" | "deferred" | "needs_review";
+export type MessageStatus = "pending" | "queued" | "wake" | "queue" | "ignored" | "processing" | "done" | "failed" | "needs_review" | "shadow" | "digest" | "deferred";
+export type JobStatus = "queued" | "running" | "replied" | "skipped" | "completed" | "deferred" | "failed" | "interrupted" | "cancelled" | "needs_review";
 
 export interface StoredMessage {
   id: string;
@@ -25,6 +25,7 @@ export interface StoredJob {
   message_ids: string;
   status: JobStatus;
   created: number;
+  started: number;
   finished: number | null;
   reason: string;
   agent_id: string;
@@ -65,11 +66,15 @@ export class MailState {
         intent TEXT NOT NULL, receipt TEXT NOT NULL DEFAULT '', updated INTEGER NOT NULL);
       CREATE TABLE IF NOT EXISTS reviews(id INTEGER PRIMARY KEY, target TEXT NOT NULL, operation TEXT NOT NULL,
         note TEXT NOT NULL, actor TEXT NOT NULL, created INTEGER NOT NULL);
+      CREATE TABLE IF NOT EXISTS label_work(id TEXT PRIMARY KEY, thread_id TEXT NOT NULL,
+        status TEXT NOT NULL, reason TEXT NOT NULL DEFAULT '', due INTEGER NOT NULL DEFAULT 0);
+      CREATE TABLE IF NOT EXISTS scan_results(id TEXT PRIMARY KEY, result TEXT NOT NULL);
     `);
     // Additive migration: never rewrite prior jobs, receipts, or activation cutoffs.
     for (const [table, columns] of Object.entries({
       messages: { attempts: "INTEGER NOT NULL DEFAULT 0", due: "INTEGER NOT NULL DEFAULT 0" },
-      jobs: { agent_id: "TEXT NOT NULL DEFAULT ''", session_key: "TEXT NOT NULL DEFAULT ''", run_id: "TEXT NOT NULL DEFAULT ''", evidence_hash: "TEXT NOT NULL DEFAULT ''", policy_version: "INTEGER NOT NULL DEFAULT 0" },
+      jobs: { agent_id: "TEXT NOT NULL DEFAULT ''", session_key: "TEXT NOT NULL DEFAULT ''", run_id: "TEXT NOT NULL DEFAULT ''", evidence_hash: "TEXT NOT NULL DEFAULT ''", policy_version: "INTEGER NOT NULL DEFAULT 0", started: "INTEGER NOT NULL DEFAULT 0" },
+      policies: { settings: "TEXT NOT NULL DEFAULT '{}'" },
     })) {
       const existing = new Set(this.db.prepare(`PRAGMA table_info(${table})`).all().map(row => row.name));
       for (const [column, declaration] of Object.entries(columns)) if (!existing.has(column)) this.db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${declaration}`);

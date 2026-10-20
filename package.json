@@ -2,7 +2,7 @@
   "name": "@unblocklabs/gog-email-watch",
   "version": "0.2.2",
   "license": "MIT",
-  "description": "Durable Gmail triage, review-only inbox maintenance, and approved-sender agent workflows through gog.",
+  "description": "Gmail backlog wake/queue/delete triage, independent labels, and approved-sender agent workflows through gog.",
   "type": "module",
   "main": "./dist/index.js",
   "publishConfig": {

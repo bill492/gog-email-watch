@@ -8,8 +8,19 @@ and individual email addresses.
 
 Version 0.2 extends the port with the inbox-triage feature in issue #1. Preserve
 thread context and reply/skip handling when triage is omitted. When explicitly
-enabled, add owner-bounded screening, versioned policy, review-only historical
-scans, scoped mailbox effects, digests, completion/defer and recovery controls.
+enabled, classify mail already present at first enablement as wake, queue or delete.
+Use one consolidated wake per processing cycle and an agent-configured queue
+interval. Independent label definitions (name + description) use a separate Jev
+request. Explicit date-range historical scans apply deletion only, never queue,
+wake or label. No inference allowance, processing quota, prompt-size/count caps,
+forced review or label-prefix restrictions. Jev concurrency defaults to 50 and is
+configurable. Preserve existing send receipts and operational recovery.
+Agents can read watcher status, inspect unclassified failures and persisted jobs,
+and retrieve the latest historical scan's progress/results after a lost response
+or restart. Diagnostic reads never reactivate jobs or authorize sends. Explicit
+job deferral resumes eligible work independently of the ordinary queue interval.
+Policy tools expose both stored settings (including null inheritance) and their
+effective values. Reuse the existing service and SQLite state for these surfaces.
 The original port constraints below still apply where not superseded by this
 explicit feature scope. The saved review/design is in `tmp/2026-10-19-inbox-triage-review-and-plan.md`.
 
@@ -42,8 +53,9 @@ Under `plugins.entries.gog-email-watch`:
 }
 ```
 
-Domains and addresses are alternatives: either list can be empty, but at least one
-must contain an entry. Match exact parsed sender domains/addresses, not display names.
+Domains and addresses are alternatives: at least one must contain an entry for
+the new-mail responder. Both may be empty for triage-only use. Match exact parsed
+sender domains/addresses, not display names.
 
 Default to agent `main`, a 120-second poll interval, and the existing `gog` on PATH.
 Allow overrides for agent, interval, executable path and self-address aliases where
@@ -54,8 +66,9 @@ reuse existing gog credentials and environment.
 
 - Poll for new mail from configured senders; keep the current authentication,
   self-mail and automated-message exclusions.
-- Keep activation cutoffs so enabling the automation or adding a sender does not
-  process their old mail. Keep overlap and reconciliation for missed polls.
+- Keep responder activation cutoffs so adding a sender does not send replies to
+  their old mail. Backlog triage is separate and explicitly processes old mail.
+  Keep overlap and reconciliation for missed new-mail polls.
 - Persist message IDs and pending work in SQLite. Do not repeatedly dispatch a
   message because it becomes unread again or the Gateway restarts.
 - Batch new messages by thread, retain a stable session per mailbox/thread, and

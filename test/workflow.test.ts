@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { AsyncLocalStorage } from 'node:async_hooks';
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -1268,6 +1269,54 @@ test('agent concurrency is live-configurable while same-thread runs and whole-cy
     } finally { release(); await workflow.stop(); }
   }));
 });
+
+test('live settings keep timer polls and newly admitted workers in the service context', async () => withHarness(async h => {
+  const invocation = new AsyncLocalStorage<AbortSignal>();
+  h.setFixture(fixture([]));
+  let release!: () => void;
+  const firstRun = new Promise<void>(resolve => { release = resolve; });
+  const runs: Array<{ jobId: string; sessionKey: string }> = [];
+  let workflow: ReturnType<typeof createMailWorkflow>;
+  workflow = createMailWorkflow({ config: h.config, stateDir: h.stateDir, subagent: {
+    async run({ sessionKey, message: prompt }) {
+      invocation.getStore()?.throwIfAborted();
+      const jobId = jobIdFromPrompt(prompt);
+      runs.push({ jobId, sessionKey });
+      return { runId: jobId };
+    },
+    async waitForRun({ runId }) {
+      invocation.getStore()?.throwIfAborted();
+      const run = runs.find(run => run.jobId === runId)!;
+      if (run === runs[0]) await firstRun;
+      workflow.complete({ ...run, reason: 'Handled' });
+      return { status: 'ok' };
+    },
+  } });
+  try {
+    await workflow.start();
+    const first = message('aa01', 'First task');
+    const second = { ...message('aa02', 'Second task'), threadId: 'bb02' };
+    const third = { ...message('aa03', 'Later arrival'), threadId: 'bb03' };
+    h.setFixture(separateThreads([first]));
+    await workflow.poll();
+    await waitFor(() => runs.length === 1);
+    h.setFixture(separateThreads([first, second]));
+    await workflow.poll();
+    const authority = new AbortController();
+    invocation.run(authority.signal, () => workflow.policyUpdate(undefined, workflow.policyGet().version, 'operator', {
+      pollIntervalSeconds: 1, agentConcurrency: 2,
+    }));
+    authority.abort(new Error('operator tool invocation authority expired'));
+    await waitFor(() => runs.length === 2 || workflow.status().unresolvedJobs.length > 0);
+    assert.equal(runs.length, 2, 'the newly admitted worker must outlive the settings invocation');
+    release();
+    await waitFor(() => workflow.status().messages.done === 2);
+    h.setFixture(separateThreads([first, second, third]));
+    await waitFor(() => workflow.status().messages.done === 3 || workflow.status().unresolvedJobs.length > 0);
+    assert.equal(workflow.status().messages.done, 3, 'the rescheduled timer must outlive the settings invocation');
+    assert.equal(runs.length, 3);
+  } finally { release(); await workflow.stop(); }
+}));
 
 test('historical inference does not pause new-mail discovery and wakes', async () => withHarness(async h => {
   h.setFixture(fixture([]));

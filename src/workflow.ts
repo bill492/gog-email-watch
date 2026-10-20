@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import { AsyncResource } from "node:async_hooks";
 import { mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
@@ -294,7 +295,8 @@ export function createMailWorkflow(options: WorkflowOptions) {
     }
   }
 
-  async function poll(): Promise<void> {
+  // Background work belongs to this service, not a tool caller's expiring context.
+  const poll = AsyncResource.bind(async (): Promise<void> => {
     if (stopped || admitting) return;
     admitting = true;
     let ownsAdmission = true;
@@ -369,7 +371,7 @@ export function createMailWorkflow(options: WorkflowOptions) {
       polling--;
       finishStopIfIdle();
     }
-  }
+  });
 
   async function classifyPending(rows: StoredMessage[], rulesOnly: boolean) {
     const threadId = rows[0].thread_id;
@@ -610,7 +612,7 @@ ${replyGuidance()}
 Use gog_email_context for the authorized job snapshot. If work is finished without a reply, call gog_email_complete with an honest summary. Use gog_email_defer only when a specific future retry is useful; it does not acknowledge an external handoff. If no reply or action is warranted, call gog_email_skip. If blocked, provide an honest useful reply to the approved sender when appropriate.`;
   }
 
-  async function processNext(): Promise<void> {
+  const processNext = AsyncResource.bind(async (): Promise<void> => {
     if (stopped) return;
     while (workers.size < policies.settings().agentConcurrency) {
       const busy = new Set([...workers.values()].flatMap(worker => worker.threadIds));
@@ -629,7 +631,7 @@ Use gog_email_context for the authorized job snapshot. If work is finished witho
         finishStopIfIdle();
       });
     }
-  }
+  });
 
   async function processJob(first: StoredMessage | undefined, wakeJob: StoredJob | undefined, worker: { jobId?: string }): Promise<void> {
     let reservedJobId: string | undefined;

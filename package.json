@@ -1,8 +1,8 @@
 {
   "name": "@unblocklabs/gog-email-watch",
-  "version": "0.3.4",
+  "version": "0.3.5",
   "license": "MIT",
-  "description": "Gmail backlog wake/queue/skip/delete triage, independent labels, and approved-sender agent workflows through gog.",
+  "description": "Rolling recent-inbox wake/queue/skip/delete triage, independent labels, and approved-sender agent workflows through gog.",
   "type": "module",
   "main": "./dist/index.js",
   "publishConfig": {
@@ -50,7 +50,8 @@
   },
   "dependencies": {
     "@sinclair/typebox": "^0.34.41",
-    "email-addresses": "^5.0.0"
+    "email-addresses": "^5.0.0",
+    "tiktoken": "^1.0.22"
   },
   "peerDependencies": {
     "openclaw": ">=2026.9.9"

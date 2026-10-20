@@ -10,6 +10,7 @@ import { concurrently, createPolicyStore } from "./policy.js";
 import {
   GogMailClient,
   eligibility,
+  mailCutoff,
   explicitExternalRecipients,
   isGmailId,
   renderThread,
@@ -165,14 +166,14 @@ export function createMailWorkflow(options: WorkflowOptions) {
     } while (page);
   }
 
-  async function discover(after: number, scope: "approved" | "inbox", before?: number) {
-    for await (const messages of searchPages(after, scope, before)) {
+  async function discover(after: number, scope: "approved" | "inbox") {
+    for await (const messages of searchPages(after, scope)) {
       state.transaction(() => {
         const insert = state.db.prepare("INSERT OR IGNORE INTO messages(id,thread_id,received,sender,status,discovered) VALUES (?,?,0,'','pending',?)");
         for (const item of messages) {
           if (!isGmailId(item.id) || !isGmailId(item.threadId)) throw new Error("invalid Gmail identifiers");
           insert.run(item.id, item.threadId, seconds());
-          if (before !== undefined) state.db.prepare("UPDATE messages SET status='pending',due=0 WHERE id=? AND status='ignored' AND job_id IS NULL").run(item.id);
+          if (triage) state.db.prepare("UPDATE messages SET status='pending',due=0 WHERE id=? AND status='ignored' AND job_id IS NULL").run(item.id);
         }
       });
     }
@@ -185,40 +186,52 @@ export function createMailWorkflow(options: WorkflowOptions) {
       const now = seconds();
       const since = Number(state.meta("active_since") ?? 0);
       const settings = policies.settings();
+      const oldest = mailCutoff(settings.maxAgeDays);
       if (!since) throw new Error("mail watcher is not activated");
       const lastPoll = Number(state.meta("last_poll") ?? since);
       const reconcile = now - Number(state.meta("last_reconcile") ?? 0) >= settings.reconcileIntervalSeconds;
-      let after = Math.max(since - 1, Math.floor(lastPoll - settings.discoveryOverlapSeconds));
-      if (reconcile) after = Math.min(after, Math.max(since - 1, Math.floor(now - settings.reconcileLookbackSeconds)));
+      const earliest = triage ? Math.floor(oldest / 1000) : since - 1;
+      let after = Math.max(earliest, Math.floor(lastPoll - settings.discoveryOverlapSeconds));
+      if (reconcile) after = Math.min(after, Math.max(earliest, Math.floor(now - settings.reconcileLookbackSeconds)));
       // Finish discovery before any deletes can alter Gmail pagination.
       if (triage && !state.meta("triage_discovered")) {
-        await discover(0, "inbox", Math.ceil(Number(state.meta("triage_before")) / 1000));
+        await discover(Math.floor(oldest / 1000), "inbox");
         state.setMeta("triage_discovered", now);
       }
-      await discover(after, "approved");
-      if (config.triage?.wakeOnExternalReplies) await discover(after, "inbox");
+      await discover(Math.max(after, Math.floor(oldest / 1000)), triage ? "inbox" : "approved");
       state.setMeta("last_poll", now);
       if (reconcile) state.setMeta("last_reconcile", now);
       state.setMeta("last_poll_error", "");
       state.db.prepare("UPDATE messages SET status='pending' WHERE status='deferred' AND due<=?").run(now);
+      // New evidence replaces waiting work for the whole conversation. Detaching
+      // undispatched reservations leaves running/completed jobs untouched.
+      if (triage) state.db.prepare(`UPDATE messages SET status='pending',due=0
+        WHERE thread_id IN (SELECT thread_id FROM messages WHERE status='pending' AND due<=?)
+          AND (status IN ('pending','queue','wake') OR (status='processing' AND job_id IN
+            (SELECT id FROM jobs WHERE thread_id='triage' AND status='queued')))`
+      ).run(now);
       const pending = state.db.prepare("SELECT * FROM messages WHERE status='pending' AND due<=? ORDER BY discovered,id").all(now) as unknown as StoredMessage[];
       await concurrently(byThread(pending), settings.concurrency, async rows => {
         if (stopped) return;
         try {
           const thread = await mail.getThread(rows[0].thread_id);
           const messages = new Map(thread.messages.map(message => [message.id, message]));
-          const backlog = triage ? rows.filter(row => Number(messages.get(row.id)?.internalDate) < Number(state.meta("triage_before"))) : [];
-          const results = await assessBacklog(thread, backlog);
+          const results = await assessInbox(thread, triage ? rows : []);
           if (stopped) return;
+          const resumeDueQueue = rows.some(row => {
+            const previousJob = row.job_id ? state.job(row.job_id) : undefined;
+            return previousJob?.status === "deferred" || (previousJob?.thread_id === "triage" && row.reason !== "wake");
+          });
           for (const row of rows) {
             const message = messages.get(row.id);
             let result = results.get(row.id);
             if (!result) {
-              const verdict = message ? eligibility(message, config, cutoffs(), thread) : { accepted: false, reason: "message absent from Gmail thread" };
+              const verdict = message ? (Number(message.internalDate) < oldest
+                ? { accepted: false, reason: "older than maxAgeDays" } : eligibility(message, config, cutoffs(), thread))
+                : { accepted: false, reason: "message absent from Gmail thread" };
               result = { status: verdict.accepted ? "queued" : "ignored", reason: verdict.reason };
             }
-            const previousJob = row.job_id ? state.job(row.job_id) : undefined;
-            if (result.status === "queue" && previousJob && (previousJob.status === "deferred" || previousJob.thread_id === "triage")) result.status = "wake";
+            if (result.status === "queue" && resumeDueQueue) result.status = "wake";
             state.db.prepare("UPDATE messages SET received=?,sender=?,status=?,reason=?,due=?,attempts=attempts+? WHERE id=?")
               .run(message ? Number(message.internalDate) : row.received, message ? senderAddress(message) : row.sender,
                 result.status, result.reason, result.status === "pending" ? now + settings.retryDelaySeconds : 0, Number(result.status === "pending"), row.id);
@@ -243,7 +256,7 @@ export function createMailWorkflow(options: WorkflowOptions) {
     }
   }
 
-  async function assessBacklog(thread: GmailThread, rows: StoredMessage[]) {
+  async function assessInbox(thread: GmailThread, rows: StoredMessage[]) {
     const service = triage!;
     const results = new Map<string, Pick<StoredMessage, "status" | "reason">>();
     const targets: GmailMessage[] = [];
@@ -251,8 +264,11 @@ export function createMailWorkflow(options: WorkflowOptions) {
       const message = thread.messages.find(message => message.id === row.id);
       const unfinishedDelete = !!state.db.prepare("SELECT 1 FROM effects WHERE message_id=? AND status!='confirmed' AND instr(intent,'TRASH')>0").get(row.id);
       if (!message || (!message.labelIds.includes("INBOX") && !unfinishedDelete) || message.labelIds.some(label => ["SPAM", "SENT", "DRAFT"].includes(label)) ||
-        (message.labelIds.includes("TRASH") && !unfinishedDelete)) results.set(row.id, { status: "ignored", reason: "no longer in the backlog inbox" });
-      else targets.push(message);
+        (message.labelIds.includes("TRASH") && !unfinishedDelete)) results.set(row.id, { status: "ignored", reason: "no longer in the triage inbox" });
+      else if (Number(message.internalDate) < mailCutoff(policies.settings().maxAgeDays)) {
+        results.set(row.id, { status: "skipped", reason: "older than maxAgeDays" });
+        state.db.prepare("UPDATE label_work SET status='cancelled',reason='older than maxAgeDays' WHERE id=?").run(row.id);
+      } else targets.push(message);
     }
     if (!targets.length) return results;
     try {
@@ -305,6 +321,8 @@ export function createMailWorkflow(options: WorkflowOptions) {
 
   function reserveWake() {
     if (!triage || stopped) return;
+    state.db.prepare("UPDATE messages SET status='skipped',reason='older than maxAgeDays',due=0 WHERE status IN ('wake','queue') AND received<?")
+      .run(mailCutoff(policies.settings().maxAgeDays));
     const queueAt = queueWakeAt();
     const queueDue = queueAt !== null && seconds() >= queueAt;
     const rows = state.db.prepare("SELECT * FROM messages WHERE status='wake' OR (status='queue' AND ?) ORDER BY received,id").all(Number(queueDue)) as unknown as StoredMessage[];
@@ -387,7 +405,9 @@ Use gog_email_context for the authorized job snapshot. If work is finished witho
       const rejected: Array<{ id: string; reason: string }> = [];
       for (const row of rows) {
         const message = available.get(row.id);
-        const verdict = message ? eligibility(message, config, cutoffs(), thread) : { accepted: false, reason: "message-no-longer-present" };
+        const verdict = message ? (Number(message.internalDate) < mailCutoff(policies.settings().maxAgeDays)
+          ? { accepted: false, reason: "older than maxAgeDays" } : eligibility(message, config, cutoffs(), thread))
+          : { accepted: false, reason: "message-no-longer-present" };
         if (verdict.accepted) valid.push(row);
         else rejected.push({ id: row.id, reason: verdict.reason });
       }
@@ -496,9 +516,10 @@ Use gog_email_context for the authorized job snapshot. If work is finished witho
           const changed = rows.filter(row => {
             const target = thread.messages.find(message => message.id === row.id);
             const prior = state.db.prepare("SELECT evidence_hash FROM triage WHERE id=?").get(row.id);
-            return reserved(row.id) && !(target?.labelIds.includes("INBOX") && !target.labelIds.some(label => ["SPAM", "TRASH", "SENT", "DRAFT"].includes(label)) && prior?.evidence_hash === fingerprint);
+            return reserved(row.id) && !(target && Number(target.internalDate) >= mailCutoff(policies.settings().maxAgeDays) &&
+              target.labelIds.includes("INBOX") && !target.labelIds.some(label => ["SPAM", "TRASH", "SENT", "DRAFT"].includes(label)) && prior?.evidence_hash === fingerprint);
           });
-          const results = await assessBacklog(thread, changed);
+          const results = await assessInbox(thread, changed);
           for (const row of changed) {
             if (stopped || !reserved(row.id)) continue;
             const result = results.get(row.id)!;
@@ -661,7 +682,8 @@ ${policies.settings().wakePrompt}`.trimEnd(), ["gog_email_context", "gog_email_c
   function policyGet() {
     if (stopped) throw new Error("watcher is stopped");
     const current = policies.get();
-    return { ...current, concurrency: current.settings.concurrency, backlogBefore: Number(state.meta("triage_before") ?? 0) };
+    return { ...current, concurrency: current.settings.concurrency, eligibleAfter: mailCutoff(current.settings.maxAgeDays),
+      backlogBefore: Number(state.meta("triage_before") ?? 0) };
   }
   function policyUpdate(document: unknown, version: number, actor: string, settings?: unknown) {
     if (stopped) throw new Error("watcher is stopped");
@@ -813,7 +835,7 @@ ${policies.settings().wakePrompt}`.trimEnd(), ["gog_email_context", "gog_email_c
       jobs: state.counts("jobs"),
       unresolvedJobs: state.db.prepare("SELECT id,thread_id,status,reason FROM jobs WHERE status IN ('needs_review','failed','interrupted')").all(),
       triage: triage ? { policyVersion: triage.policy().version, model: config.triage!.decisionModel,
-        concurrency: policies.settings().concurrency, backlogBefore: Number(state.meta("triage_before")),
+        concurrency: policies.settings().concurrency, eligibleAfter: mailCutoff(policies.settings().maxAgeDays), backlogBefore: Number(state.meta("triage_before")),
         queueMinutes: triage.policy().document.queueMinutes, labeling, scanning,
         lastAssessmentMs: Number(state.meta("last_assessment_ms") ?? 0),
         labelWork: state.db.prepare("SELECT status,count(*) AS count FROM label_work GROUP BY status").all(),

@@ -1,8 +1,8 @@
 {
   "id": "gog-email-watch",
   "name": "Gog Email Watch",
-  "version": "0.3.4",
-  "description": "Old-mail wake/queue/skip/delete triage, independent labels and approved-sender responses.",
+  "version": "0.3.5",
+  "description": "Rolling recent-inbox wake/queue/skip/delete triage, independent labels and optional approved-sender responses.",
   "activation": {
     "onStartup": true
   },
@@ -91,7 +91,8 @@
           },
           "wakeOnExternalReplies": {
             "default": false,
-            "description": "For the new-mail responder only: also wake for authenticated human replies in threads this account participated in.",
+            "deprecated": true,
+            "description": "Legacy option. Rolling inbox triage now classifies external replies using the configured prompt.",
             "type": "boolean"
           },
           "concurrency": {
@@ -231,10 +232,35 @@
             "default": 604800,
             "type": "number"
           },
+          "maxAgeDays": {
+            "default": 30,
+            "description": "Skip older messages before inference or waking. Rolling Gmail timestamp cutoff; null disables. Explicit historical deletion scans are exempt.",
+            "anyOf": [
+              {
+                "exclusiveMinimum": 0,
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "maxInputTokens": {
+            "minimum": 1,
+            "default": 32000,
+            "description": "Estimated state plus largest question token budget. Trim oldest conversation content first; never trim policy.",
+            "type": "integer"
+          },
+          "maxRequestTokens": {
+            "minimum": 1,
+            "default": 64000,
+            "description": "Estimated state plus all questions token budget, including independent labels.",
+            "type": "integer"
+          },
           "evidence": {
             "additionalProperties": false,
             "deprecated": true,
-            "description": "Legacy settings, ignored. Jev always receives the full plaintext conversation without truncation.",
+            "description": "Legacy settings, ignored. Use maxInputTokens and maxRequestTokens; byte truncation is no longer used.",
             "type": "object",
             "properties": {
               "maxBytes": {

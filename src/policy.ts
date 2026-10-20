@@ -19,10 +19,13 @@ export const SettingsSchema = Type.Partial(Type.Object({
   discoveryOverlapSeconds: Type.Number({ minimum: 0, default: 600 }),
   reconcileIntervalSeconds: Type.Number({ exclusiveMinimum: 0, default: 3600 }),
   reconcileLookbackSeconds: Type.Number({ minimum: 0, default: 7 * 86400 }),
+  maxAgeDays: Type.Union([Type.Number({ exclusiveMinimum: 0 }), Type.Null()], { default: 30, description: "Skip older messages before inference or waking. Rolling Gmail timestamp cutoff; null disables. Explicit historical deletion scans are exempt." }),
+  maxInputTokens: Type.Integer({ minimum: 1, default: 32_000, description: "Estimated state plus largest question token budget. Trim oldest conversation content first; never trim policy." }),
+  maxRequestTokens: Type.Integer({ minimum: 1, default: 64_000, description: "Estimated state plus all questions token budget, including independent labels." }),
   evidence: Type.Partial(Type.Object({
     maxBytes: Type.Integer(),
     context: Type.Union([Type.Literal("message"), Type.Literal("thread")]),
-  }, { ...object, deprecated: true, description: "Legacy settings, ignored. Jev always receives the full plaintext conversation without truncation." })),
+  }, { ...object, deprecated: true, description: "Legacy settings, ignored. Use maxInputTokens and maxRequestTokens; byte truncation is no longer used." })),
 }, object));
 export type SettingsPatch = Static<typeof SettingsSchema>;
 type StoredSettings = Required<Omit<SettingsPatch, "evidence">>;
@@ -30,7 +33,7 @@ export const defaultSettings: StoredSettings = {
   wakePrompt: "", responderPrompt: "", pollIntervalSeconds: 120, concurrency: 50, labelConcurrency: null,
   retryDelaySeconds: null, decisionTimeoutSeconds: 30, gogTimeoutSeconds: 90, agentWaitTimeoutSeconds: 660,
   gogMaxOutputBytes: 10 * 1024 * 1024, discoveryOverlapSeconds: 600, reconcileIntervalSeconds: 3600,
-  reconcileLookbackSeconds: 7 * 86400,
+  reconcileLookbackSeconds: 7 * 86400, maxAgeDays: 30, maxInputTokens: 32_000, maxRequestTokens: 64_000,
 };
 export function parseSettings(value: unknown): SettingsPatch {
   if (!Value.Check(SettingsSchema, value)) throw new Error("invalid email runtime settings");
@@ -53,7 +56,7 @@ export const PolicySchema = Type.Object({
 }, object);
 export const TriageInputSchema = Type.Object({
   decisionModel: Type.String({ minLength: 1 }),
-  wakeOnExternalReplies: Type.Optional(Type.Boolean({ default: false, description: "For the new-mail responder only: also wake for authenticated human replies in threads this account participated in." })),
+  wakeOnExternalReplies: Type.Optional(Type.Boolean({ default: false, deprecated: true, description: "Legacy option. Rolling inbox triage now classifies external replies using the configured prompt." })),
   concurrency: Type.Optional(Type.Integer({ minimum: 1, default: 50 })),
   policy: Type.Optional(PolicySchema),
 }, object);
@@ -62,7 +65,7 @@ export type TriageConfig = Static<typeof TriageInputSchema> & { concurrency: num
 export type Action = "wake" | "queue" | "skip" | "delete";
 
 export const defaultPolicy: Policy = {
-  prompt: "Wake for current, unresolved requests or actions owned by this account that need attention now. Consider later replies, completed work and expired deadlines; a human reply alone does not require a wake. Queue non-urgent mail worth attention at the next scheduled wake. Skip resolved, expired or informational mail that needs no attention. Use delete only for mail matching the deletion instructions.",
+  prompt: "Read the newest message first, then use earlier and quoted messages as history. Identify a concrete action still owed by this account, not by another recipient. Being copied on someone else's conversation, waiting for their response, or a request already answered does not create work: skip. Ignore expired meeting requests and deadlines relative to today's date unless a current unresolved consequence is stated. Wake only for owned work that cannot wait until the next queue, such as a current outage, explicit urgent request or confirmed security incident. Queue non-urgent owned work, including a pending approval, an invitation still awaiting acceptance, or a specific account configuration problem. Skip optional onboarding/marketing, routine login/download/security confirmations and general GitHub issue/CI/bot activity without an explicit request to this account. Distinguish 'please approve/fix/accept' from 'this happened; if this was you, no action is needed'. Use delete only for matches to the deletion instructions.",
   deletePrompt: "",
   queueMinutes: 1440,
   labels: [],
@@ -89,7 +92,8 @@ export function createPolicyStore(config: MailConfig, state: MailState) {
   const configured = parsePolicy(config.triage?.policy ?? defaultPolicy);
   const configuredSettings = mergeSettings({ ...defaultSettings, pollIntervalSeconds: config.pollIntervalSeconds,
     concurrency: config.triage?.concurrency ?? 1 }, config.settings ?? {});
-  const policyHash = hash(configured), settingsHash = hash(configuredSettings);
+  // Fingerprint the file choice, not a built-in default that can change on upgrade.
+  const policyHash = hash(config.triage?.policy ?? null), settingsHash = hash(configuredSettings);
   const now = () => Math.floor(Date.now() / 1000);
   type Snapshot = { version: number; document: Policy; settings: StoredSettings };
   function read(version?: number): Snapshot {
@@ -105,7 +109,10 @@ export function createPolicyStore(config: MailConfig, state: MailState) {
   }
   function replan(previous: Snapshot | undefined, next: Snapshot) {
     if (!config.triage) return;
-    if (!previous || hash([previous.document.prompt, previous.document.deletePrompt]) !== hash([next.document.prompt, next.document.deletePrompt])) {
+    if (previous?.settings.maxAgeDays !== next.settings.maxAgeDays)
+      state.db.prepare("DELETE FROM meta WHERE key='triage_discovered'").run();
+    if (!previous || hash([previous.document.prompt, previous.document.deletePrompt, previous.settings.maxAgeDays, previous.settings.maxInputTokens, previous.settings.maxRequestTokens]) !==
+      hash([next.document.prompt, next.document.deletePrompt, next.settings.maxAgeDays, next.settings.maxInputTokens, next.settings.maxRequestTokens])) {
       // Cancel only undispatched wakes; running jobs retain their original snapshot.
       state.db.prepare("UPDATE messages SET status='pending',due=0,job_id=NULL WHERE status IN ('wake','queue','skipped','digest','shadow') OR job_id IN (SELECT id FROM jobs WHERE thread_id='triage' AND status='queued')").run();
       state.db.prepare("UPDATE jobs SET status='cancelled',finished=? WHERE thread_id='triage' AND status='queued'").run(now());
@@ -124,21 +131,30 @@ export function createPolicyStore(config: MailConfig, state: MailState) {
   const row = state.db.prepare("SELECT version,document FROM policies ORDER BY version DESC LIMIT 1").get() as { version: number; document: string } | undefined;
   const validPrevious = row && Value.Check(PolicySchema, JSON.parse(row.document));
   const policyChanged = config.triage && state.meta("triage_config_policy") !== policyHash;
-  const threadMigration = config.triage && state.meta("triage_unit") !== "thread";
+  const threadMigration = config.triage && state.meta("triage_unit") !== "rolling-thread";
   // Recognize the old file fingerprint without resetting persisted live overrides.
-  const legacySettingsHash = hash({ ...configuredSettings, evidence: { maxBytes: 16_000, context: "thread", ...config.settings?.evidence } });
+  const { maxAgeDays: _age, maxInputTokens: _input, maxRequestTokens: _request, ...previousSettings } = configuredSettings;
+  const legacySettingsHash = hash({ ...previousSettings, evidence: { maxBytes: 16_000, context: "thread", ...config.settings?.evidence } });
+  const newOverrides = ["maxAgeDays", "maxInputTokens", "maxRequestTokens"].some(key => key in (config.settings ?? {}));
   const settingsChanged = state.meta("runtime_config_settings") !== settingsHash &&
-    state.meta("runtime_config_settings") !== legacySettingsHash;
+    (newOverrides || (state.meta("runtime_config_settings") !== hash(previousSettings) &&
+    state.meta("runtime_config_settings") !== legacySettingsHash));
   if (!validPrevious || policyChanged || settingsChanged || threadMigration) state.transaction(() => {
     const previous = validPrevious ? read() : undefined;
     const next = { version: (row?.version ?? 0) + 1,
-      document: policyChanged || !previous ? configured : previous.document,
+      document: (policyChanged && config.triage?.policy !== undefined) || !previous ? configured : previous.document,
       settings: settingsChanged || !previous ? configuredSettings : previous.settings };
     save(next, "plugin-config");
     replan(threadMigration ? undefined : previous, next);
     if (config.triage) state.setMeta("triage_config_policy", policyHash);
     state.setMeta("runtime_config_settings", settingsHash);
-    if (config.triage) state.setMeta("triage_unit", "thread");
+    if (config.triage) {
+      state.setMeta("triage_unit", "rolling-thread");
+      if (threadMigration) {
+        state.db.prepare("DELETE FROM meta WHERE key='triage_discovered'").run();
+        state.db.prepare("UPDATE messages SET status='pending',due=0 WHERE status='queued' AND job_id IS NULL").run();
+      }
+    }
   });
   function update(document: unknown, expectedVersion: number, actor: string, settings?: unknown) {
     if (document === undefined && settings === undefined) throw new Error("provide policy or settings to update");

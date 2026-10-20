@@ -1,19 +1,19 @@
 # gog-email-watch
 
-Gmail backlog triage and an approved-sender responder, using the node's existing
+Rolling Gmail inbox triage and an optional approved-sender responder, using the node's existing
 `gog` CLI and credentials.
 
-## Two separate paths
+## Two operating modes
 
-- **Existing inbox mail:** optional Jev triage chooses **wake**, **queue**, **skip**,
-  or **delete**. The cutoff is fixed when triage is first enabled; later arrivals do
-  not enter this classifier.
-- **New mail:** the existing responder handles configured senders, with full
+- **With `triage`:** Jev chooses **wake**, **queue**, **skip**, or **delete** for
+  recent existing inbox mail and newly arriving inbox mail. By default, messages
+  older than **30 days** are skipped in code before inference, labels or waking.
+  All senders can be classified; triage itself does not authorize sending a reply.
+- **Without `triage`:** the responder handles new mail from configured senders, with full
   conversation context and an in-thread reply/skip helper. Authentication,
   self-mail, automated-message exclusions and sender activation cutoffs still
-  apply. Triage prompts do not change reply authorization.
-  Approved mail remains discoverable when Gmail filters archive it, including
-  when `wakeOnExternalReplies` adds external Inbox conversation replies.
+  apply. Approved mail remains discoverable when Gmail filters archive it.
+  The same 30-day age rule also applies to pending responder work.
 
 SQLite persists discovery, classifications, pending work, agent jobs and effect
 receipts. One service uses OpenClaw's Decisions and subagent runtimes; there is
@@ -23,10 +23,10 @@ no separate scheduler, provider transport or generic queue framework.
 
 1. **Already installed?** Call `gog_email_policy_get` and `gog_email_status` with
    `{}` before changing anything. The policy tool returns the current
-   `document`, `version`, `configuredSettings`, effective `settings` and fixed `backlogBefore`
-   cutoff (Unix milliseconds; `0` when triage has not been initialized).
+   `document`, `version`, `configuredSettings`, effective `settings` and rolling
+   `eligibleAfter` cutoff (Unix milliseconds; `0` when the age rule is disabled).
 2. **New install?** Follow [Setup](#setup), then optionally enable
-   [Backlog triage](#backlog-triage). Preserve unrelated OpenClaw configuration.
+   [Inbox triage](#inbox-triage). Preserve unrelated OpenClaw configuration.
 3. **Choose the right control:** `policy.prompt` tells Jev when to wake, queue or skip;
    `policy.deletePrompt` defines deletions; `policy.labels` defines independent
    categorization. `settings.wakePrompt` and `settings.responderPrompt` instruct
@@ -96,12 +96,12 @@ All paths in the following tables are relative to
 | `gogPath` | Nonempty string; `"gog"` | Executable name on the Gateway's PATH, or an absolute executable path. |
 | `selfAddresses` | Email-address array; `[]` | Additional aliases treated as this account's own mail. The account address is always included. |
 | `pollIntervalSeconds` | Integer >= 1; `120` | File fallback for polling. Prefer `settings.pollIntervalSeconds`, which takes precedence and is live-editable. |
-| `triage` | Object; omitted | Enables existing-inbox triage. Omit for responder-only operation. |
+| `triage` | Object; omitted | Enables rolling recent/new-inbox triage. Omit for responder-only operation. |
 | `settings` | Object; `{}` | Runtime overrides listed below; omitted fields use defaults/fallbacks. |
 
 At least one of `domains` or `senders` must be nonempty unless triage is enabled.
-With triage enabled, both can be empty for backlog-only operation. These lists
-control the new-mail responder and reply authorization, not which backlog mail Jev
+With triage enabled, both can be empty. These lists
+control the responder and reply authorization, not which inbox mail Jev
 classifies. Addresses and domains are normalized to lowercase.
 
 File configuration changes take effect on service restart. Agents can change
@@ -118,7 +118,18 @@ mail content; preserve the database across upgrades to retain deduplication.
 The plugin uses normal process-umask file permissions, without forcing 0600/0700
 or checking file ownership. It does not change existing files' modes on startup.
 
-## Backlog triage
+## Inbox triage
+
+The first scan considers the last 30 days of inbox mail. Later polls discover new
+arrivals and retry unfinished work; they do not reclassify unchanged successful
+decisions. The age rule uses Gmail's message timestamp, not the sender-controlled
+Date header. "One month" means a rolling **30 × 24 hours**, configurable through
+`settings.maxAgeDays`; use `null` to disable it.
+
+The cutoff applies to each message, not the thread's original creation date.
+A new reply in an old chain is eligible; older messages remain context, not wake,
+label or delete targets. Queued mail is checked again before dispatch and expires
+without an extra Jev call. Explicit historical deletion scans bypass this age rule.
 
 Add `triage` to the plugin config:
 
@@ -158,7 +169,7 @@ and [decision-model configuration](https://docs.openclaw.ai/concepts/decision-mo
 for provider installation, secret references and model selection. Preserve existing
 provider credentials and plugin allowlist entries.
 
-Before enabling backlog triage, use this read-only checklist:
+Before enabling inbox triage, use this read-only checklist:
 
 1. Verify `gog` works for the configured account **in the Gateway's environment**:
    `gog --account agent@example.com --no-input --json gmail labels list`.
@@ -177,8 +188,8 @@ Before enabling backlog triage, use this read-only checklist:
    for provider errors. These read-only checks do not prove successful Jev inference;
    an actual successful assessment does. They do not trigger a test email or inference.
 
-**Enabling triage starts processing the real existing Inbox on the next service
-start.** The example above enables real Trash writes for matching mail. Use an
+**Enabling triage starts processing the real recent Inbox on the next service
+start and continues with new arrivals.** The example above enables real Trash writes for matching mail. Use an
 empty `deletePrompt` if you want wake/queue/skip/labels without automatic deletion.
 
 ### Triage and policy options
@@ -186,7 +197,7 @@ empty `deletePrompt` if you want wake/queue/skip/labels without automatic deleti
 | Option | Type / default | Purpose |
 | --- | --- | --- |
 | `triage.decisionModel` | `"provider/model"` string; **required when triage is present** | Must match the target agent's resolved host decision model. |
-| `triage.wakeOnExternalReplies` | Boolean; `false` | Also lets authenticated human replies to earlier Sent mail wake the **new-mail responder**, even outside approved senders. Does not grant permission to send replies to them. |
+| `triage.wakeOnExternalReplies` | Legacy Boolean; ignored | Rolling triage now classifies external replies through the same prompt as all other inbox mail. Retained for configuration compatibility. |
 | `triage.concurrency` | Integer >= 1; `50` | File fallback for workers. Prefer the live-editable `settings.concurrency`. |
 | `triage.policy` | Object; default policy below | Initial classification policy. If supplied, include all four fields below. |
 
@@ -202,12 +213,13 @@ Policy paths below are relative to `triage.policy` in the file, or `policy` in
 
 The default `prompt` is:
 
-> Wake for current, unresolved requests or actions owned by this account that need attention now. Consider later replies, completed work and expired deadlines; a human reply alone does not require a wake. Queue non-urgent mail worth attention at the next scheduled wake. Skip resolved, expired or informational mail that needs no attention. Use delete only for mail matching the deletion instructions.
+> Read the newest message first, then use earlier and quoted messages as history. Identify a concrete action still owed by this account, not by another recipient. Being copied on someone else's conversation, waiting for their response, or a request already answered does not create work: skip. Ignore expired meeting requests and deadlines relative to today's date unless a current unresolved consequence is stated. Wake only for owned work that cannot wait until the next queue, such as a current outage, explicit urgent request or confirmed security incident. Queue non-urgent owned work, including a pending approval, an invitation still awaiting acceptance, or a specific account configuration problem. Skip optional onboarding/marketing, routine login/download/security confirmations and general GitHub issue/CI/bot activity without an explicit request to this account. Distinguish 'please approve/fix/accept' from 'this happened; if this was you, no action is needed'. Use delete only for matches to the deletion instructions.
 
 ### Actions and wakes
 
 **The classification unit is a Gmail thread, not an individual message.** Jev
-receives the full plaintext chain in chronological order and returns one action
+receives plaintext chain context in chronological order, trimmed only to the
+configured estimated token budgets when necessary, and returns one action
 for that conversation. Discovery groups messages across all pages before inference.
 Ten eligible messages in one chain mean one action request, not ten. Each message
 still has its own status and mutation receipt for inspection and reliable retries.
@@ -225,8 +237,8 @@ still has its own status and mutation receipt for inspection and reliable retrie
   This is Jev's classification, distinct from `gog_email_skip`, which finishes an
   agent job that has already been dispatched.
 - **delete:** when the conversation matches the deletion instructions, move its
-  eligible backlog **messages** to Gmail Trash, removing INBOX. Sent mail, drafts,
-  newer mail and messages outside the scan range are context, not deletion targets.
+  eligible recent-inbox **messages** to Gmail Trash, removing INBOX. Sent mail, drafts,
+  older mail and messages outside the scan range are context, not deletion targets.
   No archive action, forced review, quarantine, protected-category veto, or
   confidence threshold. No permanent-delete or purge endpoint; Gmail's normal
   Trash retention applies.
@@ -235,17 +247,20 @@ The agent's deletion snippet is appended to the trusted classification instructi
 Email text remains untrusted evidence. An empty deletion snippet disables automatic
 deletion. Write the snippet to express the actual intended deletion criteria.
 
-The fixed backlog cutoff survives restarts. Work and receipts already completed
+The rolling age window advances with time. Work and receipts already completed
 are not automatically replayed. Explicit deletion scans recheck current Gmail
 state, so a restored message can be deleted again if it still matches the prompt.
-Deletion rechecks folder eligibility immediately before writing: routine backlog
+Deletion rechecks folder eligibility immediately before writing: routine inbox
 mail must still be in Inbox; historical scans may also delete archived mail.
 Classification failures remain pending and retry on later polls;
 there is no attempt ceiling, daily inference allowance or plugin dollar cap.
 
-Polling does not reclassify successfully queued or skipped mail. Immediately before
+Polling does not reclassify unchanged queued or skipped mail. A newly discovered
+reply reconciles the conversation's waiting messages together, including wakes
+reserved but not yet dispatched, so older members do not trigger a second wake.
+Running and completed jobs remain untouched. Immediately before
 dispatching a wake, the plugin fetches the current threads and checks mailbox scope.
-Only changed threads are reassessed: resolved items can become skip, urgent items
+Expired messages are dropped without inference. Only changed threads are reassessed: resolved items can become skip, urgent items
 can return to queue, and removed/archived items leave the wake. Unchanged threads
 reuse their decisions, even on a later day. Read/inference failures retry without
 waking on stale evidence or postponing already-due work for another queue interval.
@@ -337,7 +352,10 @@ reread, merge your intended edit into the latest state, and retry.
    (`pollIntervalSeconds`, `triage.concurrency`), then explicit `settings` values.
 2. Tool updates persist in SQLite and survive restarts while file defaults remain
    unchanged. You do not need to copy live edits back into the config file.
-3. A changed file policy replaces the whole policy on restart. Changed file runtime
+3. An explicitly changed file policy replaces the whole policy on restart. Omitted
+   `triage.policy` preserves the saved policy, including across built-in default
+   changes; removing it does not reset agent customizations. To adopt a new default,
+   supply it explicitly in the file or through the policy tool. Changed file runtime
    settings/fallbacks replace the whole settings block, with omitted keys reset to
    their file defaults. The other block keeps its tool edits if unchanged.
 
@@ -376,7 +394,10 @@ host/provider/platform constraints.
 | `gogMaxOutputBytes` | Integer >= 1; `10485760` (10 MiB) | Maximum buffered output from each gog subprocess. |
 | `discoveryOverlapSeconds` | Number >= 0; `600` | New-mail discovery overlap behind the previous poll. |
 | `reconcileIntervalSeconds` | Number > 0; `3600` | Interval between wider new-mail discovery checks. |
-| `reconcileLookbackSeconds` | Number >= 0; `604800` (7 days) | Lookback for those checks; never moves the sender activation or backlog cutoffs. |
+| `reconcileLookbackSeconds` | Number >= 0; `604800` (7 days) | Lookback for those checks, bounded by the rolling age window and sender activation in responder mode. |
+| `maxAgeDays` | Number > 0 or `null`; `30` | Skip older messages before inference, labels and wakes. `null` disables the age rule. Historical deletion scans are exempt. |
+| `maxInputTokens` | Integer >= 1; `32000` | Estimated tokens for state plus the largest question. Oversized conversation content drops oldest messages first, retaining the newest. |
+| `maxRequestTokens` | Integer >= 1; `64000` | Estimated tokens for state plus all questions, including a multi-label request. Prompt and label definitions are never truncated. |
 
 For example, read the current version and then call:
 
@@ -414,9 +435,11 @@ does not download attachments. Host/provider/platform limits still apply.
 
 Legacy `settings.evidence.maxBytes` and `settings.evidence.context` fields are
 accepted but ignored; remove them when convenient. They cannot truncate a chain.
-On first upgrade to thread classification, undispatched message-level decisions
-are reconsidered as conversations. Completed or uncertain agent executions and
-send receipts are preserved, as are live settings and the original backlog cutoff.
+On first upgrade to rolling triage, recent inbox mail is rediscovered and
+undispatched decisions reconsidered. Completed or uncertain agent executions,
+send receipts and live settings are preserved. `backlogBefore` is retained only
+as legacy diagnostic data; it no longer excludes new arrivals. Existing custom
+prompts remain custom: explicitly update `policy.prompt` to adopt the new default.
 
 ### Job and diagnostic tools
 
@@ -438,7 +461,7 @@ triage wake is for processing context and completing/deferring/skipping work;
 
 Status's `activeJob` describes the plugin's current job, not proof that every host
 run has terminated. `startedAt`, `elapsedSeconds`, `nextQueueWakeAt` and
-`nextDeferredWakeAt` use seconds; `backlogBefore` alone uses Unix milliseconds.
+`nextDeferredWakeAt` use seconds; `eligibleAfter` and legacy `backlogBefore` use Unix milliseconds.
 Queue/deferred times are eligibility times, not guaranteed delivery times; null
 means no waiting work of that kind. `triageEnabled` is explicit on running services.
 
@@ -495,7 +518,7 @@ scan replay is added.
 
 ### Evidence and actual technical bounds
 
-Jev sees the **full plaintext conversation, without a plugin byte or token cap**,
+Jev sees the plaintext conversation up to the configured estimated token budgets,
 preferring the MIME plaintext alternative and converting HTML only when necessary.
 Messages are chronological; draft bodies are excluded. Each message starts with its sent date
 (the sender-provided `Date` header, retaining its timezone). If missing, Gmail's
@@ -512,13 +535,22 @@ sender, sent date, whether it is from this account, the latest self-sent date,
 and per-message sender/authentication/automation signals. Jev decides whether later
 replies actually resolve the request; the mere existence of a reply does not force skip.
 
-Neither evidence nor prompt/label definitions are truncated. Requests exceeding
-the provider's actual context window fail visibly rather than silently losing
-content. [Jev's documented default limits](https://docs.typesafe.ai/models#context-length)
-are 32k tokens for state plus one question and 64k for state plus all questions.
+Oversized evidence drops the oldest messages first. If the newest message alone
+is too large, its beginning is retained, including its date/headers and opening
+text. The request marks `truncated: true` and inspection coverage records
+`conversation trimmed to token budget`. Full on-disk agent transcripts are never
+trimmed. Prompt/label definitions are never trimmed; if they and metadata alone
+exceed the budget, the request fails explicitly.
+
+Token counting uses `tiktoken`'s `cl100k_base` as an **estimate**: Jev publishes
+neither its tokenizer nor a token-count endpoint, so exact upstream fit is not
+guaranteed. The defaults mirror [Jev's documented limits](https://docs.typesafe.ai/models#context-length):
+32k tokens for state plus one question and 64k for state plus all questions.
 Optional long context raises both to 262k; the installed OpenClaw TypeSafe provider
-does not enable that header and separately limits JSON requests to 4 MiB. Removing
-the email plugin's truncation does not change those upstream limits.
+does not enable that header and separately limits JSON requests to 4 MiB. Raising
+these settings does not raise upstream limits. A rejected request remains pending
+for retry; lower the estimated budgets if a different input still exceeds Jev's
+actual token limit. Do not enable long context merely to avoid trimming.
 
 Transport deadlines, output buffer and discovery reconciliation
 are configurable above. The MIME parser retains its 30-level depth limit.
@@ -549,8 +581,8 @@ ownership check or forced 0600/0700 mode.
 - **Decision provider/model mismatch:** ensure the target agent's resolved host
   decision model equals `triage.decisionModel` and its Jev provider has credentials.
   The plugin does not silently reroute email to another model.
-- **No wake:** check `gog_email_status` and `gog_email_inspect`. New arrivals
-  are not backlog mail; queued mail waits for its interval; a running agent job
+- **No wake:** check `gog_email_status` and `gog_email_inspect`. Messages older than
+  `maxAgeDays` skip without inference; queued mail waits for its interval; a running agent job
   delays dispatch. Failed classification remains pending for retry rather than
   becoming a queue decision. Skipped mail never wakes; polling queued or skipped
   mail does not reclassify it.

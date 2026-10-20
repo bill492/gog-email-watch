@@ -141,6 +141,11 @@ export function sentDate(message: GmailMessage): string {
   return first(headers(message), "date").trim() || `${new Date(Number(message.internalDate)).toISOString()} (Gmail timestamp; sent Date header missing)`;
 }
 
+/** Gmail's timestamp, not an untrusted sender-supplied Date header. */
+export function mailCutoff(maxAgeDays: number | null): number {
+  return maxAgeDays === null ? 0 : Math.max(0, Date.now() - maxAgeDays * 86_400_000);
+}
+
 function conversationReply(message: GmailMessage, config: MailConfig, thread?: GmailThread): boolean {
   return !config.selfAddresses.includes(senderAddress(message)) && !!thread?.messages.some(prior =>
     prior.labelIds.includes("SENT") && config.selfAddresses.includes(senderAddress(prior)) &&

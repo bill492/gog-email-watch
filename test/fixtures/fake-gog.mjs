@@ -36,10 +36,15 @@ if (fixture.probeWritableDb) {
 let result;
 if (command[1] === 'messages' && command[2] === 'search') {
   result = command.includes('--page') ? fixture.pages?.[command[command.indexOf('--page') + 1]] : fixture.search;
+  if (result && command[3].split(/\s+/).includes('in:inbox')) {
+    result = { ...result, messages: result.messages.filter(({ id, threadId }) =>
+      fixture.threads?.[threadId]?.thread.messages.some(message => message.id === id && message.labelIds.includes('INBOX'))) };
+  }
 } else if (command[1] === 'thread' && command[2] === 'get') {
   if (fixture.threadDelayMs) await new Promise(resolve => setTimeout(resolve, fixture.threadDelayMs));
   result = fixture.threads?.[command[3]];
 } else if (command[1] === 'send') {
+  writeFileSync(`${process.env.GOG_TEST_CALLS}.body.html`, readFileSync(command[command.indexOf('--body-html-file') + 1]));
   if (fixture.sendFailure) {
     process.stderr.write('controlled fake gog send failure\n');
     process.exit(1);

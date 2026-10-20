@@ -39,7 +39,7 @@ export function evidence(thread: GmailThread, targetId?: string, settings: Runti
   content.text = prefix(text, available);
   content.truncated = content.text.length < text.length;
   return {
-    content, hash: fingerprint, readable: missing.size === 0,
+    content, hash: fingerprint,
     complete: missing.size === 0 && !content.truncated, truncated: content.truncated, missing: [...missing],
   };
 }

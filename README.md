@@ -12,6 +12,8 @@ Gmail backlog triage and an approved-sender responder, using the node's existing
   conversation context and an in-thread reply/skip helper. Authentication,
   self-mail, automated-message exclusions and sender activation cutoffs still
   apply. Triage prompts do not change reply authorization.
+  Approved mail remains discoverable when Gmail filters archive it, including
+  when `wakeOnExternalReplies` adds external Inbox conversation replies.
 
 SQLite persists discovery, classifications, pending work, agent jobs and effect
 receipts. One service uses OpenClaw's Decisions and subagent runtimes; there is
@@ -223,6 +225,8 @@ deletion. Write the snippet to express the actual intended deletion criteria.
 The fixed backlog cutoff survives restarts. Work and receipts already completed
 are not automatically replayed. Explicit deletion scans recheck current Gmail
 state, so a restored message can be deleted again if it still matches the prompt.
+Deletion rechecks folder eligibility immediately before writing: routine backlog
+mail must still be in Inbox; historical scans may also delete archived mail.
 Classification failures remain pending and retry on later polls;
 there is no attempt ceiling, daily inference allowance or plugin dollar cap.
 
@@ -246,6 +250,7 @@ Failed label work retries independently. There is no `Gog/` prefix requirement,
 plugin naming regex, label-count cap or description-length cap. Gmail still
 enforces its own valid names and quotas. Unrelated existing labels are preserved;
 editing a definition adds newly matching labels, not a retroactive unlabel sweep.
+If an older label write is in flight, the updated rules remain pending for retry.
 Gmail's mailbox-state labels (INBOX, SPAM, TRASH, SENT and DRAFT) cannot be applied
 through categorization; deletion belongs to the action decision. Other system
 flags such as STARRED remain usable.
@@ -477,6 +482,8 @@ wait is 11 minutes; the default CLI wait for a historical scan response is 30 mi
 timing out is not proof the scan stopped. Agent-run and send
 receipts protect against duplicate external actions; uncertain execution is an
 operational error, not a fourth Jev classification. Existing reply history is retained.
+Host-queued (`pending`) agent runs stay active and are observed until completion
+or the configured wait deadline; waiting never redispatches the run.
 
 ### Upgrading from the rule/review format
 

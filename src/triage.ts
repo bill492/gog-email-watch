@@ -85,9 +85,10 @@ export function createTriage(options: {
     return { row, action, source };
   }
 
-  async function effect(row: EffectTarget, add: string[], remove: string[], kind: "action" | "labels") {
+  async function effect(row: EffectTarget, add: string[], remove: string[], kind: "backlog" | "historical" | "labels") {
+    const policyKind = kind === "labels" ? "labels" : "action";
     signal.throwIfAborted();
-    assertCurrent(row.policy_version, kind);
+    assertCurrent(row.policy_version, policyKind);
     const key = hash({ id: row.id, add, remove, evidence: row.evidence_hash });
     // A confirmed receipt describes a past write, not the current Gmail state:
     // the user may have restored the message or removed a category since then.
@@ -96,12 +97,15 @@ export function createTriage(options: {
     signal.throwIfAborted();
     if (!target || evidence(thread).hash !== row.evidence_hash) throw new Error("mail changed before effect; retry");
     if (!remove.length && target.labelIds.includes("TRASH")) return;
-    assertCurrent(row.policy_version, kind);
+    const applied = add.every(label => target.labelIds.includes(label)) && remove.every(label => !target.labelIds.includes(label));
+    // Reconcile already-applied writes, but do not delete mail that left this scope.
+    if (kind !== "labels" && !applied && (target.labelIds.some(label => ["SPAM", "SENT", "DRAFT", "TRASH"].includes(label)) ||
+      (kind === "backlog" && !target.labelIds.includes("INBOX")))) throw new Error("mail left deletion scope before effect; retry");
+    assertCurrent(row.policy_version, policyKind);
     state.db.prepare("INSERT OR REPLACE INTO effects(id,message_id,status,intent,updated) VALUES (?,?,'pending',?,?)")
       .run(key, row.id, JSON.stringify({ add, remove }), now());
     try {
       // Gmail label updates set state; lost receipts can be reconciled or retried.
-      const applied = add.every(label => target.labelIds.includes(label)) && remove.every(label => !target.labelIds.includes(label));
       const receipt = applied ? { reconciled: true } : await mail.modify([row.id], add, remove);
       state.db.prepare("UPDATE effects SET status='confirmed',receipt=?,updated=? WHERE id=?").run(JSON.stringify(receipt), now(), key);
     } catch (error) {
@@ -110,7 +114,7 @@ export function createTriage(options: {
     }
   }
   async function deleteMail(row: TriageRecord) {
-    await effect(row, ["TRASH"], ["INBOX"], "action");
+    await effect(row, ["TRASH"], ["INBOX"], row.historical ? "historical" : "backlog");
     state.db.prepare("UPDATE label_work SET status='cancelled',reason='message deleted' WHERE id=?").run(row.id);
   }
   function scheduleLabels(id: string, threadId: string) {
@@ -140,6 +144,7 @@ export function createTriage(options: {
     assertCurrent(current.version, "labels");
     if (state.db.prepare("SELECT status FROM label_work WHERE id=?").get(id)?.status !== "pending") return;
     if (add.length) await effect({ id, thread_id: threadId, evidence_hash: source.hash, policy_version: current.version }, add, [], "labels");
+    assertCurrent(current.version, "labels");
   }
   return { policy, assess, deleteMail, scheduleLabels, label };
 }

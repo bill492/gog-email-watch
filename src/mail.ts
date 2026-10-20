@@ -143,13 +143,23 @@ function conversationReply(message: GmailMessage, config: MailConfig, thread?: G
     Number(prior.internalDate) < Number(message.internalDate));
 }
 
-export function mailFacts(message: GmailMessage, config: MailConfig, thread?: GmailThread): Facts {
+function senderSignals(message: GmailMessage) {
   const sender = senderAddress(message), domain = sender.split("@")[1] ?? "";
   const h = headers(message);
+  // Only the first Authentication-Results header belongs to the receiving MTA.
   const auth = first(h, "authentication-results").toLowerCase();
   const escaped = domain.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-  const authenticated = !!domain && /^\s*mx\.google\.com\s*;/.test(auth) && new RegExp(`\\bdmarc=pass\\b[^;]*\\bheader\\.from=${escaped}(?=[\\s;]|$)`).test(auth);
-  const automated = !["", "no"].includes(first(h, "auto-submitted").toLowerCase()) || ["bulk", "list", "junk"].includes(first(h, "precedence").toLowerCase()) || h.has("list-id") || automatedLocals.has(sender.split("@")[0]);
+  const authentication = !/^\s*mx\.google\.com\s*;/.test(auth) ? "missing-google-authentication"
+    : !domain || !new RegExp(`\\bdmarc=pass\\b[^;]*\\bheader\\.from=${escaped}(?=[\\s;]|$)`).test(auth) ? "sender-authentication-not-passed" : undefined;
+  const automation = !["", "no"].includes(first(h, "auto-submitted").toLowerCase()) ? "automatic-reply"
+    : ["bulk", "list", "junk"].includes(first(h, "precedence").toLowerCase()) || h.has("list-id") ? "mailing-list"
+    : automatedLocals.has(sender.split("@")[0]) ? "automated-sender" : undefined;
+  return { sender, domain, authentication, automation };
+}
+
+export function mailFacts(message: GmailMessage, config: MailConfig, thread?: GmailThread): Facts {
+  const { sender, domain, authentication, automation } = senderSignals(message);
+  const authenticated = authentication === undefined, automated = automation !== undefined;
   return { sender, domain, authenticated, automated, conversationReply: conversationReply(message, config, thread), approved: !!sender && authenticated && !automated && !config.selfAddresses.includes(sender) && (config.domains.includes(domain) || config.senders.includes(sender)), labels: message.labelIds };
 }
 
@@ -168,9 +178,7 @@ export function senderAddress(message: GmailMessage): string {
 // Passing thread evidence permits the configured conversation wake exception.
 // Send authorization intentionally calls this without that evidence.
 export function eligibility(message: GmailMessage, config: MailConfig, cutoffs: ActivationCutoffs, thread?: GmailThread): Eligibility {
-  const h = headers(message);
-  const sender = senderAddress(message);
-  const domain = sender.split("@")[1] ?? "";
+  const { sender, domain, authentication, automation } = senderSignals(message);
   const externalReply = config.triage?.wakeOnExternalReplies && cutoffs.conversationSince !== undefined && conversationReply(message, config, thread);
   if (!sender || (!config.domains.includes(domain) && !config.senders.includes(sender) && !externalReply)) {
     return { accepted: false, reason: "external-or-invalid-sender", sender };
@@ -186,19 +194,8 @@ export function eligibility(message: GmailMessage, config: MailConfig, cutoffs: 
   ];
   const cutoff = Math.max(cutoffs.activeSince, Math.min(...permittedSince));
   if (Number(message.internalDate) < cutoff * 1000) return { accepted: false, reason: "before-activation", sender };
-  if (!["", "no"].includes(first(h, "auto-submitted").toLowerCase())) {
-    return { accepted: false, reason: "automatic-reply", sender };
-  }
-  if (["bulk", "list", "junk"].includes(first(h, "precedence").toLowerCase()) || h.has("list-id")) {
-    return { accepted: false, reason: "mailing-list", sender };
-  }
-  if (automatedLocals.has(sender.split("@")[0])) return { accepted: false, reason: "automated-sender", sender };
-  // Only the first Authentication-Results header belongs to the receiving MTA.
-  const auth = first(h, "authentication-results").toLowerCase();
-  const escapedDomain = domain.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-  const passed = new RegExp(`\\bdmarc=pass\\b[^;]*\\bheader\\.from=${escapedDomain}(?=[\\s;]|$)`);
-  if (!/^\s*mx\.google\.com\s*;/.test(auth)) return { accepted: false, reason: "missing-google-authentication", sender };
-  if (!passed.test(auth)) return { accepted: false, reason: "sender-authentication-not-passed", sender };
+  if (automation) return { accepted: false, reason: automation, sender };
+  if (authentication) return { accepted: false, reason: authentication, sender };
   return { accepted: true, reason: externalReply && !config.domains.includes(domain) && !config.senders.includes(sender) ? "external-conversation-reply" : "internal", sender };
 }
 
@@ -304,7 +301,7 @@ function escapeHtml(value: string): string {
   return value.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;").replace(/'/g, "&#x27;");
 }
 
-export function plainTextToHtml(text: string): string {
+function plainTextToHtml(text: string): string {
   const blocks: string[] = [];
   let paragraph: string[] = [];
   let list: string[] = [];

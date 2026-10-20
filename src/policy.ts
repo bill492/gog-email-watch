@@ -59,7 +59,6 @@ export const TriageInputSchema = Type.Object({
 export type Policy = Static<typeof PolicySchema>;
 export type TriageConfig = Static<typeof TriageInputSchema> & { concurrency: number };
 export type Action = "wake" | "queue" | "delete";
-export type Plan = { action: Action };
 export type Facts = { sender: string; domain: string; approved: boolean; authenticated: boolean; automated: boolean; conversationReply: boolean; labels: string[] };
 
 export const defaultPolicy: Policy = {

@@ -64,8 +64,6 @@ export class MailState {
         coverage TEXT NOT NULL, historical INTEGER NOT NULL, updated INTEGER NOT NULL);
       CREATE TABLE IF NOT EXISTS effects(id TEXT PRIMARY KEY, message_id TEXT NOT NULL, status TEXT NOT NULL,
         intent TEXT NOT NULL, receipt TEXT NOT NULL DEFAULT '', updated INTEGER NOT NULL);
-      CREATE TABLE IF NOT EXISTS reviews(id INTEGER PRIMARY KEY, target TEXT NOT NULL, operation TEXT NOT NULL,
-        note TEXT NOT NULL, actor TEXT NOT NULL, created INTEGER NOT NULL);
       CREATE TABLE IF NOT EXISTS label_work(id TEXT PRIMARY KEY, thread_id TEXT NOT NULL,
         status TEXT NOT NULL, reason TEXT NOT NULL DEFAULT '', due INTEGER NOT NULL DEFAULT 0);
       CREATE TABLE IF NOT EXISTS scan_results(id TEXT PRIMARY KEY, result TEXT NOT NULL);

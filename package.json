@@ -1,8 +1,8 @@
 {
   "name": "@unblocklabs/gog-email-watch",
-  "version": "0.3.8",
+  "version": "0.3.9",
   "license": "MIT",
-  "description": "Rolling recent-inbox wake/queue/skip/delete triage, independent labels, and approved-sender agent workflows through gog.",
+  "description": "Label-first Gmail triage, configurable mailbox routing and approved-sender agent workflows through gog.",
   "type": "module",
   "main": "./dist/index.js",
   "publishConfig": {

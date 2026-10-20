@@ -4,7 +4,8 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { promisify } from "node:util";
 import emailAddresses from "email-addresses";
-import { defaultSettings, effectiveSettings, parseSettings, parseTriage, type RuntimeSettings, type SettingsPatch, type TriageConfig } from "./policy.js";
+import { Type } from "@sinclair/typebox";
+import { SettingsSchema, TriageInputSchema, defaultSettings, effectiveSettings, parseSettings, parseTriage, type RuntimeSettings, type SettingsPatch, type TriageConfig } from "./policy.js";
 
 const run = promisify(execFile);
 const excludedLabels = new Set(["SPAM", "TRASH", "SENT", "DRAFT"]);
@@ -21,6 +22,43 @@ export interface MailConfig {
   selfAddresses: string[];
   triage?: TriageConfig;
   settings?: SettingsPatch;
+}
+
+/** Shared by runtime parsing and the generated install-time manifest. */
+export const MailboxConfigSchema = Type.Object({
+  account: Type.String({ minLength: 1 }),
+  domains: Type.Optional(Type.Array(Type.String(), { default: [] })),
+  senders: Type.Optional(Type.Array(Type.String(), { default: [] })),
+  agentId: Type.Optional(Type.String({ minLength: 1, default: "main" })),
+  pollIntervalSeconds: Type.Optional(Type.Integer({ minimum: 1, default: 120 })),
+  gogPath: Type.Optional(Type.String({ minLength: 1, default: "gog" })),
+  selfAddresses: Type.Optional(Type.Array(Type.String(), { default: [] })),
+  triage: Type.Optional(TriageInputSchema),
+  settings: Type.Optional(SettingsSchema),
+}, { additionalProperties: false, anyOf: [
+  { required: ["domains"], properties: { domains: { minItems: 1 } } },
+  { required: ["senders"], properties: { senders: { minItems: 1 } } },
+  { required: ["triage"] },
+  { required: ["settings"], properties: { settings: { required: ["wakeFrom"], properties: { wakeFrom: { minItems: 1 } } } } },
+  { required: ["settings"], properties: { settings: { required: ["wakeQuery"], properties: { wakeQuery: { pattern: "\\S" } } } } },
+] });
+export const PluginConfigSchema = Type.Union([
+  MailboxConfigSchema,
+  Type.Object({ mailboxes: Type.Array(MailboxConfigSchema, { minItems: 1 }) }, { additionalProperties: false }),
+]);
+
+export interface PluginConfig { mailboxes: MailConfig[] }
+
+export function parsePluginConfig(value: unknown): PluginConfig {
+  const raw = record(value);
+  if ("mailboxes" in raw) {
+    if (Object.keys(raw).some(key => key !== "mailboxes")) throw new Error("use either mailboxes or the legacy single-account configuration, not both");
+    if (!Array.isArray(raw.mailboxes) || !raw.mailboxes.length) throw new Error("mailboxes must be a nonempty list");
+    const mailboxes = raw.mailboxes.map(parseConfig);
+    if (new Set(mailboxes.map(mailbox => mailbox.account)).size !== mailboxes.length) throw new Error("duplicate mailbox account");
+    return { mailboxes };
+  }
+  return { mailboxes: [parseConfig(raw)] };
 }
 
 export interface GmailMessage {
@@ -113,6 +151,7 @@ export function parseWakeFrom(rules: readonly string[]): string[] {
 
 export function parseConfig(value: unknown): MailConfig {
   const raw = record(value);
+  if ("mailboxes" in raw) throw new Error("nested mailboxes are not supported");
   if (typeof raw.account !== "string") throw new Error("account is required");
   const account = address(raw.account);
   const configuredDomains = raw.domains ?? [];
@@ -122,7 +161,8 @@ export function parseConfig(value: unknown): MailConfig {
   const domains = [...new Set(configuredDomains.map(senderDomain))];
   const senders = addressList(raw.senders ?? [], "senders");
   const settings = parseSettings(raw.settings ?? {});
-  if (!domains.length && !senders.length && !settings.wakeFrom?.length && !raw.triage) throw new Error("configure at least one domain, sender or wakeFrom rule, or enable triage");
+  if (!domains.length && !senders.length && !settings.wakeFrom?.length && !settings.wakeQuery?.trim() && !raw.triage)
+    throw new Error("configure at least one domain, sender, wakeFrom rule or wakeQuery, or enable triage");
   const selfAddresses = [...new Set([account, ...addressList(raw.selfAddresses ?? [], "selfAddresses")])];
   const agentId = raw.agentId ?? "main";
   const pollIntervalSeconds = raw.pollIntervalSeconds ?? 120;
@@ -230,16 +270,6 @@ export function eligibility(message: GmailMessage, config: MailConfig, cutoffs: 
   return { accepted: true, reason: externalReply && !config.domains.includes(domain) && !config.senders.includes(sender) ? "external-conversation-reply" : "internal", sender };
 }
 
-/** Explicit notification permission, never reply authority. Listed bots are intentional. */
-export function wakeFromEligibility(message: GmailMessage, config: MailConfig, since: number): Eligibility {
-  const { sender, authentication } = senderSignals(message);
-  const reason = !sender ? "invalid-sender" : config.selfAddresses.includes(sender) ? "self"
-    : !message.labelIds.includes("INBOX") || message.labelIds.some(label => excludedLabels.has(label)) ? "excluded-label"
-    : Number(message.internalDate) < since ? "before-wakeFrom-activation"
-    : authentication ?? "wakeFrom";
-  return { accepted: reason === "wakeFrom", reason, sender };
-}
-
 function parseVisibleAddresses(values: readonly string[]): string[] {
   return values.flatMap((value) => (emailAddresses.parseAddressList(value) ?? [])
     .filter((part) => 'address' in part)
@@ -247,7 +277,7 @@ function parseVisibleAddresses(values: readonly string[]): string[] {
     .filter((item) => item.split("@").length === 2 && !!item.split("@")[0] && !/[\s\x00-\x1f]/.test(item)));
 }
 
-export function replyRecipients(message: GmailMessage, config: MailConfig, allowExternalScheduling = false): ReplyRecipients {
+export function replyRecipients(message: GmailMessage, config: MailConfig, allowExternalScheduling = false, allowed?: readonly string[] | null): ReplyRecipients {
   const h = headers(message);
   const sender = senderAddress(message);
   const seen = new Set(config.selfAddresses);
@@ -256,7 +286,8 @@ export function replyRecipients(message: GmailMessage, config: MailConfig, allow
   for (const [target, values] of [[to, [sender]], [to, h.get("to") ?? []], [cc, h.get("cc") ?? []]] as const) {
     for (const recipient of parseVisibleAddresses(values)) {
       const domain = recipient.split("@")[1];
-      if (!allowExternalScheduling && !config.domains.includes(domain) && !config.senders.includes(recipient)) continue;
+      if (allowed ? !allowed.includes(domain) && !allowed.includes(recipient)
+        : !allowExternalScheduling && !config.domains.includes(domain) && !config.senders.includes(recipient)) continue;
       if (!seen.has(recipient)) {
         target.push(recipient);
         seen.add(recipient);
@@ -402,15 +433,18 @@ export class GogMailClient {
     catch { throw new Error("gog returned invalid JSON"); }
   }
 
-  async searchPage(afterSeconds: number, page?: string, scope: "approved" | "inbox" | "all" = this.config.triage?.wakeOnExternalReplies ? "inbox" : "approved", beforeSeconds?: number): Promise<{ messages: SearchMessage[]; nextPageToken?: string }> {
+  async searchPage(afterSeconds: number, page?: string, scope: "approved" | "inbox" | "all" = this.config.triage?.wakeOnExternalReplies ? "inbox" : "approved", beforeSeconds?: number, nativeQuery?: string): Promise<{ messages: SearchMessage[]; nextPageToken?: string }> {
     if (!Number.isInteger(afterSeconds) || afterSeconds < 0) throw new Error("invalid search cutoff");
     if (beforeSeconds !== undefined && (!Number.isInteger(beforeSeconds) || beforeSeconds <= afterSeconds)) throw new Error("invalid search end date");
     const senders = [
       ...this.config.domains.map((domain) => `from:(@${domain})`),
       ...this.config.senders.map((sender) => `from:${sender}`),
     ];
-    if (scope === "approved" && !senders.length) return { messages: [] };
-    const query = `${afterSeconds ? `after:${afterSeconds}` : ""} ${beforeSeconds === undefined ? "" : `before:${beforeSeconds}`} ${scope === "all" ? "" : scope === "inbox" ? "in:inbox" : `{${senders.join(" ")}}`} -in:spam -in:trash -in:sent -in:drafts`;
+    if (nativeQuery !== undefined && (typeof nativeQuery !== "string" || /[\x00\r\n]/.test(nativeQuery))) throw new Error("invalid Gmail query");
+    if (nativeQuery === undefined && scope === "approved" && !senders.length) return { messages: [] };
+    const selection = nativeQuery === undefined ? scope === "all" ? "" : scope === "inbox" ? "in:inbox" : `{${senders.join(" ")}}`
+      : nativeQuery.trim() ? `(${nativeQuery.trim()})` : "";
+    const query = `${afterSeconds ? `after:${afterSeconds}` : ""} ${beforeSeconds === undefined ? "" : `before:${beforeSeconds}`} ${selection} -in:spam -in:trash -in:sent -in:drafts`;
     const data = record(await this.gog(["gmail", "messages", "search", query, "--max", "100", ...(page ? ["--page", page] : [])]));
     if (!Array.isArray(data.messages)) throw new Error("unexpected Gmail search response");
     const messages = data.messages.map((item) => {

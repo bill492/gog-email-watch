@@ -1,8 +1,8 @@
 {
   "id": "gog-email-watch",
   "name": "Gog Email Watch",
-  "version": "0.3.8",
-  "description": "Rolling recent-inbox wake/queue/skip/delete triage, independent labels and optional approved-sender responses.",
+  "version": "0.3.9",
+  "description": "Label-first Gmail triage, configurable mailbox routing and optional approved-sender responses.",
   "activation": {
     "onStartup": true
   },
@@ -15,6 +15,7 @@
       "gog_email_defer",
       "gog_email_policy_get",
       "gog_email_policy_update",
+      "gog_email_policy_preview",
       "gog_email_scan",
       "gog_email_inspect",
       "gog_email_resolve",
@@ -32,146 +33,96 @@
     }
   ],
   "configSchema": {
-    "type": "object",
-    "additionalProperties": false,
-    "required": [
-      "account"
-    ],
-    "properties": {
-      "account": {
-        "type": "string",
-        "minLength": 1
-      },
-      "domains": {
-        "type": "array",
-        "items": {
-          "type": "string"
-        },
-        "default": []
-      },
-      "senders": {
-        "type": "array",
-        "items": {
-          "type": "string"
-        },
-        "default": []
-      },
-      "agentId": {
-        "type": "string",
-        "default": "main",
-        "minLength": 1
-      },
-      "pollIntervalSeconds": {
-        "type": "integer",
-        "minimum": 1,
-        "default": 120
-      },
-      "gogPath": {
-        "type": "string",
-        "default": "gog",
-        "minLength": 1
-      },
-      "selfAddresses": {
-        "type": "array",
-        "items": {
-          "type": "string"
-        },
-        "default": []
-      },
-      "triage": {
+    "anyOf": [
+      {
         "additionalProperties": false,
-        "type": "object",
-        "required": [
-          "decisionModel"
-        ],
-        "properties": {
-          "decisionModel": {
-            "minLength": 1,
-            "type": "string"
-          },
-          "wakeOnExternalReplies": {
-            "default": false,
-            "deprecated": true,
-            "description": "Legacy option. Rolling inbox triage now classifies external replies using the configured prompt.",
-            "type": "boolean"
-          },
-          "concurrency": {
-            "minimum": 1,
-            "default": 50,
-            "type": "integer"
-          },
-          "policy": {
-            "additionalProperties": false,
-            "type": "object",
+        "anyOf": [
+          {
             "required": [
-              "prompt",
-              "deletePrompt",
-              "queueMinutes",
-              "labels"
+              "domains"
             ],
             "properties": {
-              "prompt": {
-                "description": "Instructions for choosing wake, queue, skip or delete. Email content is evidence, not instructions.",
-                "type": "string"
-              },
-              "deletePrompt": {
-                "description": "Describe which emails may be moved to Trash. Empty means no automatic deletion.",
-                "type": "string"
-              },
-              "queueMinutes": {
-                "exclusiveMinimum": 0,
-                "description": "Wake interval for queued mail. Empty queues never wake.",
-                "type": "number"
-              },
-              "labels": {
-                "type": "array",
-                "items": {
-                  "additionalProperties": false,
-                  "type": "object",
-                  "required": [
-                    "name",
-                    "description"
-                  ],
-                  "properties": {
-                    "name": {
-                      "minLength": 1,
-                      "type": "string"
-                    },
-                    "description": {
-                      "type": "string"
-                    }
+              "domains": {
+                "minItems": 1
+              }
+            }
+          },
+          {
+            "required": [
+              "senders"
+            ],
+            "properties": {
+              "senders": {
+                "minItems": 1
+              }
+            }
+          },
+          {
+            "required": [
+              "triage"
+            ]
+          },
+          {
+            "required": [
+              "settings"
+            ],
+            "properties": {
+              "settings": {
+                "required": [
+                  "wakeFrom"
+                ],
+                "properties": {
+                  "wakeFrom": {
+                    "minItems": 1
+                  }
+                }
+              }
+            }
+          },
+          {
+            "required": [
+              "settings"
+            ],
+            "properties": {
+              "settings": {
+                "required": [
+                  "wakeQuery"
+                ],
+                "properties": {
+                  "wakeQuery": {
+                    "pattern": "\\S"
                   }
                 }
               }
             }
           }
-        }
-      },
-      "settings": {
-        "additionalProperties": false,
+        ],
         "type": "object",
+        "required": [
+          "account"
+        ],
         "properties": {
-          "wakeFrom": {
+          "account": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "domains": {
             "default": [],
-            "description": "Email addresses or exact domains (e.g. person@example.com or example.com) whose new inbox mail bypasses Jev and wakes per thread. No implicit subdomains or reply permission.",
             "type": "array",
             "items": {
               "type": "string"
             }
           },
-          "replyAllowed": {
-            "default": true,
-            "description": "Allow in-thread replies in responder and triage jobs. Existing approved-sender and recipient checks still apply. Live-editable; false disables sends.",
-            "type": "boolean"
+          "senders": {
+            "default": [],
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
           },
-          "wakePrompt": {
-            "default": "",
-            "description": "Additional instructions for the awakened triage agent, not Jev.",
-            "type": "string"
-          },
-          "responderPrompt": {
-            "default": "",
-            "description": "Additional instructions for new-mail responder jobs.",
+          "agentId": {
+            "minLength": 1,
+            "default": "main",
             "type": "string"
           },
           "pollIntervalSeconds": {
@@ -179,176 +130,808 @@
             "default": 120,
             "type": "integer"
           },
-          "concurrency": {
-            "minimum": 1,
-            "default": 50,
-            "type": "integer"
+          "gogPath": {
+            "minLength": 1,
+            "default": "gog",
+            "type": "string"
           },
-          "agentConcurrency": {
-            "minimum": 1,
-            "default": 1,
-            "description": "Concurrent independent agent jobs. Each triage cycle remains one wake; jobs sharing a Gmail thread stay ordered.",
-            "type": "integer"
+          "selfAddresses": {
+            "default": [],
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
           },
-          "labelConcurrency": {
-            "default": null,
-            "description": "Independent label workers; null inherits concurrency.",
-            "anyOf": [
-              {
-                "minimum": 1,
-                "type": "integer"
-              },
-              {
-                "type": "null"
-              }
-            ]
-          },
-          "retryDelaySeconds": {
-            "default": null,
-            "description": "Delay before retry eligibility; null inherits polling interval. Retries run on polls.",
-            "anyOf": [
-              {
-                "minimum": 0,
-                "type": "number"
-              },
-              {
-                "type": "null"
-              }
-            ]
-          },
-          "decisionTimeoutSeconds": {
-            "exclusiveMinimum": 0,
-            "default": 30,
-            "type": "number"
-          },
-          "gogTimeoutSeconds": {
-            "exclusiveMinimum": 0,
-            "default": 90,
-            "type": "number"
-          },
-          "agentWaitTimeoutSeconds": {
-            "exclusiveMinimum": 0,
-            "default": 660,
-            "description": "Maximum observation-call duration, sliced for shutdown responsiveness. Nonterminal timeouts renew observation; never a job runtime limit.",
-            "type": "number"
-          },
-          "gogMaxOutputBytes": {
-            "minimum": 1,
-            "default": 10485760,
-            "type": "integer"
-          },
-          "discoveryOverlapSeconds": {
-            "minimum": 0,
-            "default": 600,
-            "type": "number"
-          },
-          "reconcileIntervalSeconds": {
-            "exclusiveMinimum": 0,
-            "default": 3600,
-            "type": "number"
-          },
-          "reconcileLookbackSeconds": {
-            "default": null,
-            "description": "Reconciliation lookback; null covers the rolling age window in triage (all Inbox mail if maxAgeDays is null), or seven days in responder mode. Explicit numbers override it.",
-            "anyOf": [
-              {
-                "minimum": 0,
-                "type": "number"
-              },
-              {
-                "type": "null"
-              }
-            ]
-          },
-          "maxAgeDays": {
-            "default": 30,
-            "description": "Skip older messages before inference or waking. Rolling Gmail timestamp cutoff; null disables. Explicit historical deletion scans are exempt.",
-            "anyOf": [
-              {
-                "exclusiveMinimum": 0,
-                "type": "number"
-              },
-              {
-                "type": "null"
-              }
-            ]
-          },
-          "maxInputTokens": {
-            "minimum": 1,
-            "default": 32000,
-            "description": "Estimated state plus largest question token budget. Trim oldest conversation content first; never trim policy.",
-            "type": "integer"
-          },
-          "maxRequestTokens": {
-            "minimum": 1,
-            "default": 64000,
-            "description": "Estimated state plus all questions token budget, including independent labels.",
-            "type": "integer"
-          },
-          "evidence": {
+          "triage": {
             "additionalProperties": false,
-            "deprecated": true,
-            "description": "Legacy settings, ignored. Use maxInputTokens and maxRequestTokens; byte truncation is no longer used.",
             "type": "object",
+            "required": [
+              "decisionModel"
+            ],
             "properties": {
-              "maxBytes": {
+              "decisionModel": {
+                "minLength": 1,
+                "type": "string"
+              },
+              "wakeOnExternalReplies": {
+                "default": false,
+                "deprecated": true,
+                "description": "Legacy option. Rolling inbox triage now classifies external replies using the configured prompt.",
+                "type": "boolean"
+              },
+              "concurrency": {
+                "minimum": 1,
+                "default": 50,
                 "type": "integer"
               },
-              "context": {
-                "anyOf": [
-                  {
-                    "const": "message",
+              "policy": {
+                "additionalProperties": false,
+                "type": "object",
+                "required": [
+                  "prompt",
+                  "deletePrompt",
+                  "queueMinutes",
+                  "labels"
+                ],
+                "properties": {
+                  "prompt": {
+                    "description": "Shared context for Jev's label classifications. Code routes matched labels; email content is evidence, not instructions.",
                     "type": "string"
                   },
-                  {
-                    "const": "thread",
+                  "deletePrompt": {
+                    "description": "Describe which emails may be moved to Trash. Empty means no automatic deletion.",
                     "type": "string"
+                  },
+                  "queueMinutes": {
+                    "exclusiveMinimum": 0,
+                    "description": "Wake interval for queued mail. Empty queues never wake.",
+                    "type": "number"
+                  },
+                  "labels": {
+                    "type": "array",
+                    "items": {
+                      "additionalProperties": false,
+                      "type": "object",
+                      "required": [
+                        "name",
+                        "description"
+                      ],
+                      "properties": {
+                        "name": {
+                          "minLength": 1,
+                          "type": "string"
+                        },
+                        "description": {
+                          "type": "string"
+                        },
+                        "action": {
+                          "description": "Routing when this label matches. Code uses wake > queue > delete > skip; delete additionally requires nonempty deletePrompt.",
+                          "anyOf": [
+                            {
+                              "const": "wake",
+                              "type": "string"
+                            },
+                            {
+                              "const": "queue",
+                              "type": "string"
+                            },
+                            {
+                              "const": "skip",
+                              "type": "string"
+                            },
+                            {
+                              "const": "delete",
+                              "type": "string"
+                            }
+                          ]
+                        },
+                        "match": {
+                          "additionalProperties": false,
+                          "type": "object",
+                          "properties": {
+                            "senders": {
+                              "type": "array",
+                              "items": {
+                                "type": "string"
+                              }
+                            },
+                            "domains": {
+                              "type": "array",
+                              "items": {
+                                "type": "string"
+                              }
+                            },
+                            "query": {
+                              "description": "Native Gmail query, combined with any sender/domain conditions. Without sender conditions, matches authenticated non-self mail selected by the query.",
+                              "type": "string"
+                            },
+                            "newOnly": {
+                              "default": false,
+                              "description": "Baseline existing matches; apply only to new arrivals and later selection entries. False classifies recent existing mail too.",
+                              "type": "boolean"
+                            }
+                          },
+                          "description": "Deterministic authenticated non-self sender/address, exact-domain and/or Gmail query match. An explicit action, including skip, settles routing without Jev."
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "settings": {
+            "additionalProperties": false,
+            "type": "object",
+            "properties": {
+              "wakeFrom": {
+                "default": [],
+                "deprecated": true,
+                "description": "Compatibility alias for authenticated new-only wake label rules. Prefer policy.labels[].match.senders/domains. Waking never grants reply permission.",
+                "type": "array",
+                "items": {
+                  "type": "string"
+                }
+              },
+              "wakeScope": {
+                "default": "in:inbox",
+                "deprecated": true,
+                "description": "Compatibility query scope for wakeFrom/wakeQuery label rules. Prefer policy.labels[].match.query.",
+                "type": "string"
+              },
+              "wakeQuery": {
+                "default": "",
+                "deprecated": true,
+                "description": "Compatibility alias for a new-only wake label rule using a native Gmail query. Prefer policy.labels[].match.query.",
+                "type": "string"
+              },
+              "triageQuery": {
+                "default": "in:inbox",
+                "description": "Gmail search selecting mail for label-first triage. Empty includes archived mail; Spam, Trash, Sent and Draft are always excluded.",
+                "type": "string"
+              },
+              "replyAllowed": {
+                "default": true,
+                "description": "Allow in-thread replies in responder and triage jobs. Existing approved-sender and recipient checks still apply. Live-editable; false disables sends.",
+                "type": "boolean"
+              },
+              "triageReplyAllowed": {
+                "default": null,
+                "description": "Triage reply permission; null inherits replyAllowed. Global replyAllowed=false always disables sends.",
+                "anyOf": [
+                  {
+                    "type": "boolean"
+                  },
+                  {
+                    "type": "null"
                   }
                 ]
+              },
+              "replyRecipients": {
+                "default": null,
+                "description": "Allowed reply recipients as addresses or exact domains; null inherits domains and senders. Waking never grants reply permission.",
+                "anyOf": [
+                  {
+                    "type": "array",
+                    "items": {
+                      "type": "string"
+                    }
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              },
+              "completionLabels": {
+                "default": [],
+                "description": "Gmail labels applied after confirmed handling, including a deliberate no-action decision; never after failed or uncertain work.",
+                "type": "array",
+                "items": {
+                  "minLength": 1,
+                  "type": "string"
+                }
+              },
+              "wakePrompt": {
+                "default": "",
+                "description": "Additional instructions for the awakened triage agent, not Jev.",
+                "type": "string"
+              },
+              "responderPrompt": {
+                "default": "",
+                "description": "Additional instructions for new-mail responder jobs.",
+                "type": "string"
+              },
+              "pollIntervalSeconds": {
+                "minimum": 1,
+                "default": 120,
+                "type": "integer"
+              },
+              "concurrency": {
+                "minimum": 1,
+                "default": 50,
+                "type": "integer"
+              },
+              "agentConcurrency": {
+                "minimum": 1,
+                "default": 1,
+                "description": "Concurrent independent agent jobs. Each completed classification pass forms one ready-mail batch; jobs sharing a Gmail thread stay ordered.",
+                "type": "integer"
+              },
+              "labelConcurrency": {
+                "default": null,
+                "description": "Independent label workers; null inherits concurrency.",
+                "anyOf": [
+                  {
+                    "minimum": 1,
+                    "type": "integer"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              },
+              "retryDelaySeconds": {
+                "default": null,
+                "description": "Delay before retry eligibility; null inherits polling interval. Retries run on polls.",
+                "anyOf": [
+                  {
+                    "minimum": 0,
+                    "type": "number"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              },
+              "decisionTimeoutSeconds": {
+                "exclusiveMinimum": 0,
+                "default": 30,
+                "type": "number"
+              },
+              "gogTimeoutSeconds": {
+                "exclusiveMinimum": 0,
+                "default": 90,
+                "type": "number"
+              },
+              "agentWaitTimeoutSeconds": {
+                "exclusiveMinimum": 0,
+                "default": 660,
+                "description": "Maximum observation-call duration, sliced for shutdown responsiveness. Nonterminal timeouts renew observation; never a job runtime limit.",
+                "type": "number"
+              },
+              "gogMaxOutputBytes": {
+                "minimum": 1,
+                "default": 10485760,
+                "type": "integer"
+              },
+              "discoveryOverlapSeconds": {
+                "minimum": 0,
+                "default": 600,
+                "type": "number"
+              },
+              "reconcileIntervalSeconds": {
+                "exclusiveMinimum": 0,
+                "default": 3600,
+                "type": "number"
+              },
+              "reconcileLookbackSeconds": {
+                "default": null,
+                "description": "Reconciliation lookback; null covers the rolling age window in triage (all Inbox mail if maxAgeDays is null), or seven days in responder mode. Explicit numbers override it.",
+                "anyOf": [
+                  {
+                    "minimum": 0,
+                    "type": "number"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              },
+              "maxAgeDays": {
+                "default": 30,
+                "description": "Skip older messages before inference or waking. Rolling Gmail timestamp cutoff; null disables. Explicit historical deletion scans are exempt.",
+                "anyOf": [
+                  {
+                    "exclusiveMinimum": 0,
+                    "type": "number"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              },
+              "maxInputTokens": {
+                "minimum": 1,
+                "default": 32000,
+                "description": "Estimated state plus largest question token budget. Trim oldest conversation content first; never trim policy.",
+                "type": "integer"
+              },
+              "maxRequestTokens": {
+                "minimum": 1,
+                "default": 64000,
+                "description": "Estimated state plus all questions token budget, including independent labels.",
+                "type": "integer"
+              },
+              "evidence": {
+                "additionalProperties": false,
+                "deprecated": true,
+                "description": "Legacy settings, ignored. Use maxInputTokens and maxRequestTokens; byte truncation is no longer used.",
+                "type": "object",
+                "properties": {
+                  "maxBytes": {
+                    "type": "integer"
+                  },
+                  "context": {
+                    "anyOf": [
+                      {
+                        "const": "message",
+                        "type": "string"
+                      },
+                      {
+                        "const": "thread",
+                        "type": "string"
+                      }
+                    ]
+                  }
+                }
               }
             }
           }
         }
-      }
-    },
-    "anyOf": [
-      {
-        "required": [
-          "domains"
-        ],
-        "properties": {
-          "domains": {
-            "minItems": 1
-          }
-        }
       },
       {
+        "additionalProperties": false,
+        "type": "object",
         "required": [
-          "senders"
+          "mailboxes"
         ],
         "properties": {
-          "senders": {
-            "minItems": 1
-          }
-        }
-      },
-      {
-        "required": [
-          "triage"
-        ]
-      },
-      {
-        "required": [
-          "settings"
-        ],
-        "properties": {
-          "settings": {
-            "required": [
-              "wakeFrom"
-            ],
-            "properties": {
-              "wakeFrom": {
-                "minItems": 1
+          "mailboxes": {
+            "minItems": 1,
+            "type": "array",
+            "items": {
+              "additionalProperties": false,
+              "anyOf": [
+                {
+                  "required": [
+                    "domains"
+                  ],
+                  "properties": {
+                    "domains": {
+                      "minItems": 1
+                    }
+                  }
+                },
+                {
+                  "required": [
+                    "senders"
+                  ],
+                  "properties": {
+                    "senders": {
+                      "minItems": 1
+                    }
+                  }
+                },
+                {
+                  "required": [
+                    "triage"
+                  ]
+                },
+                {
+                  "required": [
+                    "settings"
+                  ],
+                  "properties": {
+                    "settings": {
+                      "required": [
+                        "wakeFrom"
+                      ],
+                      "properties": {
+                        "wakeFrom": {
+                          "minItems": 1
+                        }
+                      }
+                    }
+                  }
+                },
+                {
+                  "required": [
+                    "settings"
+                  ],
+                  "properties": {
+                    "settings": {
+                      "required": [
+                        "wakeQuery"
+                      ],
+                      "properties": {
+                        "wakeQuery": {
+                          "pattern": "\\S"
+                        }
+                      }
+                    }
+                  }
+                }
+              ],
+              "type": "object",
+              "required": [
+                "account"
+              ],
+              "properties": {
+                "account": {
+                  "minLength": 1,
+                  "type": "string"
+                },
+                "domains": {
+                  "default": [],
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  }
+                },
+                "senders": {
+                  "default": [],
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  }
+                },
+                "agentId": {
+                  "minLength": 1,
+                  "default": "main",
+                  "type": "string"
+                },
+                "pollIntervalSeconds": {
+                  "minimum": 1,
+                  "default": 120,
+                  "type": "integer"
+                },
+                "gogPath": {
+                  "minLength": 1,
+                  "default": "gog",
+                  "type": "string"
+                },
+                "selfAddresses": {
+                  "default": [],
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  }
+                },
+                "triage": {
+                  "additionalProperties": false,
+                  "type": "object",
+                  "required": [
+                    "decisionModel"
+                  ],
+                  "properties": {
+                    "decisionModel": {
+                      "minLength": 1,
+                      "type": "string"
+                    },
+                    "wakeOnExternalReplies": {
+                      "default": false,
+                      "deprecated": true,
+                      "description": "Legacy option. Rolling inbox triage now classifies external replies using the configured prompt.",
+                      "type": "boolean"
+                    },
+                    "concurrency": {
+                      "minimum": 1,
+                      "default": 50,
+                      "type": "integer"
+                    },
+                    "policy": {
+                      "additionalProperties": false,
+                      "type": "object",
+                      "required": [
+                        "prompt",
+                        "deletePrompt",
+                        "queueMinutes",
+                        "labels"
+                      ],
+                      "properties": {
+                        "prompt": {
+                          "description": "Shared context for Jev's label classifications. Code routes matched labels; email content is evidence, not instructions.",
+                          "type": "string"
+                        },
+                        "deletePrompt": {
+                          "description": "Describe which emails may be moved to Trash. Empty means no automatic deletion.",
+                          "type": "string"
+                        },
+                        "queueMinutes": {
+                          "exclusiveMinimum": 0,
+                          "description": "Wake interval for queued mail. Empty queues never wake.",
+                          "type": "number"
+                        },
+                        "labels": {
+                          "type": "array",
+                          "items": {
+                            "additionalProperties": false,
+                            "type": "object",
+                            "required": [
+                              "name",
+                              "description"
+                            ],
+                            "properties": {
+                              "name": {
+                                "minLength": 1,
+                                "type": "string"
+                              },
+                              "description": {
+                                "type": "string"
+                              },
+                              "action": {
+                                "description": "Routing when this label matches. Code uses wake > queue > delete > skip; delete additionally requires nonempty deletePrompt.",
+                                "anyOf": [
+                                  {
+                                    "const": "wake",
+                                    "type": "string"
+                                  },
+                                  {
+                                    "const": "queue",
+                                    "type": "string"
+                                  },
+                                  {
+                                    "const": "skip",
+                                    "type": "string"
+                                  },
+                                  {
+                                    "const": "delete",
+                                    "type": "string"
+                                  }
+                                ]
+                              },
+                              "match": {
+                                "additionalProperties": false,
+                                "type": "object",
+                                "properties": {
+                                  "senders": {
+                                    "type": "array",
+                                    "items": {
+                                      "type": "string"
+                                    }
+                                  },
+                                  "domains": {
+                                    "type": "array",
+                                    "items": {
+                                      "type": "string"
+                                    }
+                                  },
+                                  "query": {
+                                    "description": "Native Gmail query, combined with any sender/domain conditions. Without sender conditions, matches authenticated non-self mail selected by the query.",
+                                    "type": "string"
+                                  },
+                                  "newOnly": {
+                                    "default": false,
+                                    "description": "Baseline existing matches; apply only to new arrivals and later selection entries. False classifies recent existing mail too.",
+                                    "type": "boolean"
+                                  }
+                                },
+                                "description": "Deterministic authenticated non-self sender/address, exact-domain and/or Gmail query match. An explicit action, including skip, settles routing without Jev."
+                              }
+                            }
+                          }
+                        }
+                      }
+                    }
+                  }
+                },
+                "settings": {
+                  "additionalProperties": false,
+                  "type": "object",
+                  "properties": {
+                    "wakeFrom": {
+                      "default": [],
+                      "deprecated": true,
+                      "description": "Compatibility alias for authenticated new-only wake label rules. Prefer policy.labels[].match.senders/domains. Waking never grants reply permission.",
+                      "type": "array",
+                      "items": {
+                        "type": "string"
+                      }
+                    },
+                    "wakeScope": {
+                      "default": "in:inbox",
+                      "deprecated": true,
+                      "description": "Compatibility query scope for wakeFrom/wakeQuery label rules. Prefer policy.labels[].match.query.",
+                      "type": "string"
+                    },
+                    "wakeQuery": {
+                      "default": "",
+                      "deprecated": true,
+                      "description": "Compatibility alias for a new-only wake label rule using a native Gmail query. Prefer policy.labels[].match.query.",
+                      "type": "string"
+                    },
+                    "triageQuery": {
+                      "default": "in:inbox",
+                      "description": "Gmail search selecting mail for label-first triage. Empty includes archived mail; Spam, Trash, Sent and Draft are always excluded.",
+                      "type": "string"
+                    },
+                    "replyAllowed": {
+                      "default": true,
+                      "description": "Allow in-thread replies in responder and triage jobs. Existing approved-sender and recipient checks still apply. Live-editable; false disables sends.",
+                      "type": "boolean"
+                    },
+                    "triageReplyAllowed": {
+                      "default": null,
+                      "description": "Triage reply permission; null inherits replyAllowed. Global replyAllowed=false always disables sends.",
+                      "anyOf": [
+                        {
+                          "type": "boolean"
+                        },
+                        {
+                          "type": "null"
+                        }
+                      ]
+                    },
+                    "replyRecipients": {
+                      "default": null,
+                      "description": "Allowed reply recipients as addresses or exact domains; null inherits domains and senders. Waking never grants reply permission.",
+                      "anyOf": [
+                        {
+                          "type": "array",
+                          "items": {
+                            "type": "string"
+                          }
+                        },
+                        {
+                          "type": "null"
+                        }
+                      ]
+                    },
+                    "completionLabels": {
+                      "default": [],
+                      "description": "Gmail labels applied after confirmed handling, including a deliberate no-action decision; never after failed or uncertain work.",
+                      "type": "array",
+                      "items": {
+                        "minLength": 1,
+                        "type": "string"
+                      }
+                    },
+                    "wakePrompt": {
+                      "default": "",
+                      "description": "Additional instructions for the awakened triage agent, not Jev.",
+                      "type": "string"
+                    },
+                    "responderPrompt": {
+                      "default": "",
+                      "description": "Additional instructions for new-mail responder jobs.",
+                      "type": "string"
+                    },
+                    "pollIntervalSeconds": {
+                      "minimum": 1,
+                      "default": 120,
+                      "type": "integer"
+                    },
+                    "concurrency": {
+                      "minimum": 1,
+                      "default": 50,
+                      "type": "integer"
+                    },
+                    "agentConcurrency": {
+                      "minimum": 1,
+                      "default": 1,
+                      "description": "Concurrent independent agent jobs. Each completed classification pass forms one ready-mail batch; jobs sharing a Gmail thread stay ordered.",
+                      "type": "integer"
+                    },
+                    "labelConcurrency": {
+                      "default": null,
+                      "description": "Independent label workers; null inherits concurrency.",
+                      "anyOf": [
+                        {
+                          "minimum": 1,
+                          "type": "integer"
+                        },
+                        {
+                          "type": "null"
+                        }
+                      ]
+                    },
+                    "retryDelaySeconds": {
+                      "default": null,
+                      "description": "Delay before retry eligibility; null inherits polling interval. Retries run on polls.",
+                      "anyOf": [
+                        {
+                          "minimum": 0,
+                          "type": "number"
+                        },
+                        {
+                          "type": "null"
+                        }
+                      ]
+                    },
+                    "decisionTimeoutSeconds": {
+                      "exclusiveMinimum": 0,
+                      "default": 30,
+                      "type": "number"
+                    },
+                    "gogTimeoutSeconds": {
+                      "exclusiveMinimum": 0,
+                      "default": 90,
+                      "type": "number"
+                    },
+                    "agentWaitTimeoutSeconds": {
+                      "exclusiveMinimum": 0,
+                      "default": 660,
+                      "description": "Maximum observation-call duration, sliced for shutdown responsiveness. Nonterminal timeouts renew observation; never a job runtime limit.",
+                      "type": "number"
+                    },
+                    "gogMaxOutputBytes": {
+                      "minimum": 1,
+                      "default": 10485760,
+                      "type": "integer"
+                    },
+                    "discoveryOverlapSeconds": {
+                      "minimum": 0,
+                      "default": 600,
+                      "type": "number"
+                    },
+                    "reconcileIntervalSeconds": {
+                      "exclusiveMinimum": 0,
+                      "default": 3600,
+                      "type": "number"
+                    },
+                    "reconcileLookbackSeconds": {
+                      "default": null,
+                      "description": "Reconciliation lookback; null covers the rolling age window in triage (all Inbox mail if maxAgeDays is null), or seven days in responder mode. Explicit numbers override it.",
+                      "anyOf": [
+                        {
+                          "minimum": 0,
+                          "type": "number"
+                        },
+                        {
+                          "type": "null"
+                        }
+                      ]
+                    },
+                    "maxAgeDays": {
+                      "default": 30,
+                      "description": "Skip older messages before inference or waking. Rolling Gmail timestamp cutoff; null disables. Explicit historical deletion scans are exempt.",
+                      "anyOf": [
+                        {
+                          "exclusiveMinimum": 0,
+                          "type": "number"
+                        },
+                        {
+                          "type": "null"
+                        }
+                      ]
+                    },
+                    "maxInputTokens": {
+                      "minimum": 1,
+                      "default": 32000,
+                      "description": "Estimated state plus largest question token budget. Trim oldest conversation content first; never trim policy.",
+                      "type": "integer"
+                    },
+                    "maxRequestTokens": {
+                      "minimum": 1,
+                      "default": 64000,
+                      "description": "Estimated state plus all questions token budget, including independent labels.",
+                      "type": "integer"
+                    },
+                    "evidence": {
+                      "additionalProperties": false,
+                      "deprecated": true,
+                      "description": "Legacy settings, ignored. Use maxInputTokens and maxRequestTokens; byte truncation is no longer used.",
+                      "type": "object",
+                      "properties": {
+                        "maxBytes": {
+                          "type": "integer"
+                        },
+                        "context": {
+                          "anyOf": [
+                            {
+                              "const": "message",
+                              "type": "string"
+                            },
+                            {
+                              "const": "thread",
+                              "type": "string"
+                            }
+                          ]
+                        }
+                      }
+                    }
+                  }
+                }
               }
             }
           }
@@ -357,6 +940,10 @@
     ]
   },
   "uiHints": {
+    "mailboxes": {
+      "label": "Gmail mailboxes",
+      "help": "A list of independently configured accounts. Use either this list or the legacy account fields, not both."
+    },
     "account": {
       "label": "Gmail account",
       "help": "An account already authenticated in this node's gog CLI."

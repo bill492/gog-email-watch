@@ -68,6 +68,10 @@ export class MailState {
       CREATE TABLE IF NOT EXISTS label_work(id TEXT PRIMARY KEY, thread_id TEXT NOT NULL,
         status TEXT NOT NULL, reason TEXT NOT NULL DEFAULT '', due INTEGER NOT NULL DEFAULT 0);
       CREATE TABLE IF NOT EXISTS scan_results(id TEXT PRIMARY KEY, result TEXT NOT NULL);
+      CREATE TABLE IF NOT EXISTS label_matches(rule TEXT NOT NULL,id TEXT NOT NULL,entered INTEGER NOT NULL DEFAULT 0,
+        PRIMARY KEY(rule,id));
+      CREATE TABLE IF NOT EXISTS completion_work(id TEXT PRIMARY KEY, labels TEXT NOT NULL,
+        status TEXT NOT NULL, reason TEXT NOT NULL DEFAULT '', due INTEGER NOT NULL DEFAULT 0);
     `);
     // Additive migration: never rewrite prior jobs, receipts, or activation cutoffs.
     for (const [table, columns] of Object.entries({

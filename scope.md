@@ -6,26 +6,47 @@ Port Alfie's working email automation into a reusable OpenClaw plugin. Use each
 node's existing gog CLI and credentials, with configurable mailbox, sender domains
 and individual email addresses.
 
-Version 0.2 extends the port with the inbox-triage feature in issue #1. Preserve
-thread context and reply/skip handling when triage is omitted. When explicitly
-enabled, classify mail already present at first enablement as wake, queue, skip or delete.
-Skip keeps mail untouched without a wake; independent labeling still applies.
-Every message carries its sent date (or a clearly identified Gmail timestamp
-fallback), and every Jev request includes the current date and Gateway timezone.
-Use one consolidated wake per processing cycle and an agent-configured queue
-interval. Independent label definitions (name + description) use a separate Jev
-request. Explicit date-range historical scans apply deletion only, never queue,
-wake or label. No inference allowance, processing quota, prompt-size/count caps,
-forced review or label-prefix restrictions. Jev concurrency defaults to 50 and is
-configurable. Preserve existing send receipts and operational recovery.
-Agents can read watcher status, inspect unclassified failures and persisted jobs,
-and retrieve the latest historical scan's progress/results after a lost response
-or restart. Diagnostic reads never reactivate jobs or authorize sends. Explicit
-job deferral resumes eligible work independently of the ordinary queue interval.
-Policy tools expose both stored settings (including null inheritance) and their
-effective values. Reuse the existing service and SQLite state for these surfaces.
-The original port constraints below still apply where not superseded by this
-explicit feature scope. The saved review/design is in `tmp/2026-10-19-inbox-triage-review-and-plan.md`.
+## Current common engine
+
+1. Authenticated exact sender/domain rules classify matching labels first.
+2. Jev classifies remaining semantic labels, with apply/skip answers only.
+3. Code maps labels to wake/queue/delete/skip using that fixed precedence.
+
+An explicit deterministic action, including skip, bypasses Jev. Topic-only code
+labels can coexist with semantic labels. Nonempty deletePrompt explicitly gates
+deletion; historical date-range scans classify deletion matches only. Keep one
+consolidated wake per ready classification pass, an agent-configured queue interval,
+and separate Gmail label delivery that never gates agent waking. Code-only rules
+run across pending threads before Jev starts, so unrelated inference cannot occupy
+their worker capacity. Both passes use one persisted plan and reservation/dispatcher.
+No separate express-lane classification or dispatch engine.
+
+Resolved/handled is lifecycle state: confirmed reply, explicit completion or
+deliberate skip, not Jev certification of external work. Optional completion
+labels retry independently; deferrals, failures and uncertain outcomes do not earn
+them. Preserve uncertain-send holds and receipts, and never replay completed work.
+
+Support legacy single-mailbox config or a list of isolated mailbox configurations.
+Use native Gmail queries in label matches and the base triage selection, not a new
+query DSL. Explicit new-only rules baseline existing matches and track later entry
+durably without reviving completed/held work. Keep old wake settings as deprecated
+aliases into ordinary labels, preserving old cutoffs and receipts. Keep global and
+triage-specific reply switches separate from sender and recipient authority.
+Customize through settings and Jev prompts/label definitions, not per-node code.
+
+Provide a supported preview using the real workflow over a private SQLite
+snapshot: real reads/inference, projected effects, no Gmail writes, agent runs or
+production state changes. Diagnostics remain read-only. Keep existing live policy
+versioning, rolling age/token settings, explicit deferral and historical scans.
+Migration reconsiders unexecuted classifications while preserving saved prompts,
+settings, completed/uncertain jobs and send receipts. Legacy topic-only policies
+gain ordinary configurable routing labels.
+
+Every message carries its sent date or a clearly identified Gmail timestamp
+fallback; every Jev request includes the current date and Gateway timezone.
+Jev concurrency defaults to 50. No daily quota, forced review, arbitrary label
+prefix restrictions or plugin-owned provider transport. The original port
+constraints below apply where not superseded by this scope.
 
 ## Keep it lean
 
@@ -56,14 +77,14 @@ Under `plugins.entries.gog-email-watch`:
 }
 ```
 
-Domains and addresses are alternatives: at least one must contain an entry for
-the new-mail responder. Both may be empty for triage-only use. Match exact parsed
+Domains and addresses are alternatives for the approved-sender responder. Both
+may be empty for triage-only or explicit wakeFrom/wakeQuery notification use. Match exact parsed
 sender domains/addresses, not display names.
 
 Default to agent `main`, a 120-second poll interval, and the existing `gog` on PATH.
 Allow overrides for agent, interval, executable path and self-address aliases where
-needed. Automatically exclude the configured account itself. One mailbox per node;
-reuse existing gog credentials and environment.
+needed. Automatically exclude the configured account itself. Each mailbox reuses
+existing gog credentials and environment, with isolated state and policy.
 
 ## Existing behavior to preserve
 
@@ -76,7 +97,8 @@ reuse existing gog credentials and environment.
   message because it becomes unread again or the Gateway restarts.
 - Batch new messages by thread, retain a stable session per mailbox/thread, and
   give the agent the full chronological conversation, including previous replies.
-- Run one mail job at a time while polling continues.
+- Default to one mail job at a time while polling continues; allow independent
+  agent concurrency while serializing jobs sharing a Gmail thread.
 - Preserve reply-in-thread and explicit skip completion, existing recipient
   filtering, and uncertain-send tracking. Adapt the current helper to the plugin
   rather than creating a general-purpose email tool.
@@ -125,6 +147,7 @@ behavior checks; once they pass, stop unless something changed or still looks wr
 Do not add tests for coverage or implementation details.
 
 Reuse the host Decisions runtime; no plugin-owned provider transports. No
-multi-account framework, dashboard, OAuth setup, Pub/Sub,
-standalone daemon or fleet orchestration. Installation on Alfie and other nodes is
+generic account/workflow framework, dashboard, OAuth setup, Pub/Sub,
+standalone daemon or fleet orchestration. Node-specific schedules, metadata/body
+exclusions, business integrations and live migrations are deferred. Installation on Alfie and other nodes is
 a later step; do not replace their running automation during development.

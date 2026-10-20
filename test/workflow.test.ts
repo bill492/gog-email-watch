@@ -53,6 +53,7 @@ type Fixture = {
   probeWritableDb?: boolean;
   modifyUncertain?: boolean;
   threadDelayMs?: number;
+  threadFailOnce?: string[];
   labelListFailure?: boolean;
   labels?: Array<{ id: string; name: string; type: 'user' | 'system' }>;
 };
@@ -89,8 +90,8 @@ function separateThreads(messages: GmailMessage[]): Fixture {
     threads: Object.fromEntries(messages.map(m => [m.threadId, { thread: { id: m.threadId, messages: [m] } }])), probeWritableDb: true };
 }
 
-async function waitFor(predicate: () => boolean): Promise<void> {
-  const deadline = performance.now() + 5000;
+async function waitFor(predicate: () => boolean, timeoutMs = 5000): Promise<void> {
+  const deadline = performance.now() + timeoutMs;
   while (!predicate()) {
     if (performance.now() > deadline) throw new Error('timed out waiting for workflow');
     await new Promise((resolve) => setTimeout(resolve, 20));
@@ -150,6 +151,232 @@ function withHarness(fn: (h: {
     rmSync(dir, { recursive: true, force: true });
   });
 }
+
+test('wakeFrom bypasses unavailable Jev, coalesces threads and retains dedup across live edits and restart', async t => withHarness(async h => {
+  t.mock.timers.enable({ apis: ['Date'], now: Date.now() });
+  h.setFixture(fixture([]));
+  let workflow: ReturnType<typeof createMailWorkflow>;
+  const covered: string[][] = [];
+  const provider = assessments();
+  const subagent: MailSubagent = {
+    async run({ message: prompt, sessionKey }) {
+      const jobId = jobIdFromPrompt(prompt);
+      const context = workflow.context(jobId, sessionKey);
+      covered.push(context.messages.flatMap(item => item.messageIds));
+      assert.equal(context.messages[0].replyAllowed, false, 'wake permission does not grant reply authority');
+      await assert.rejects(workflow.reply({ jobId, sessionKey, body: 'Not authorized' }), /rejected/);
+      workflow.complete({ jobId, sessionKey, reason: 'Handled' });
+      return { runId: jobId };
+    },
+    async waitForRun() { return { status: 'ok' }; },
+  };
+  const config = triageConfig(h.config, { policy: { ...defaultPolicy, labels: [{ name: 'Work', description: 'Work mail' }] } });
+  workflow = createMailWorkflow({ config, stateDir: h.stateDir, ...provider, subagent });
+  try {
+    await workflow.start();
+    workflow.policyUpdate(undefined, workflow.policyGet().version, 'helper', { wakeFrom: ['NO-REPLY@other.test', 'OUTSIDE.TEST', 'outside.test'] });
+    assert.deepEqual(workflow.policyGet().settings.wakeFrom, ['no-reply@other.test', 'outside.test']);
+    const activated = Date.now();
+    const first = message('aa01', 'First', { sender: 'no-reply@other.test' });
+    const second = message('aa02', 'Second', { sender: 'no-reply@other.test' });
+    h.setFixture(fixture([first, second]));
+    await workflow.poll(); await waitFor(() => !workflow.status().working);
+    assert.deepEqual(covered, [['aa01', 'aa02']]);
+    assert.equal(provider.calls(), 0, 'neither action nor label inference runs');
+    assert.equal(h.calls().some(args => args.includes('modify') || args.includes('create')), false);
+    await workflow.stop();
+    workflow = createMailWorkflow({ config, stateDir: h.stateDir, ...provider, subagent });
+    await workflow.start(); await workflow.poll();
+    assert.equal(covered.length, 1);
+    t.mock.timers.setTime(activated + 60000);
+    workflow.policyUpdate(undefined, workflow.policyGet().version, 'helper', {
+      wakeFrom: [...workflow.policyGet().settings.wakeFrom, 'another@outside.test'],
+    });
+    const later = message('aa03', 'Earlier domain rule still covers this mail', { sender: 'another@outside.test', received: activated + 30000 });
+    h.setFixture(fixture([first, second, later]));
+    await workflow.poll(); await waitFor(() => !workflow.status().working);
+    assert.deepEqual(covered, [['aa01', 'aa02'], ['aa03']]);
+    assert.equal(provider.calls(), 0);
+    workflow.policyUpdate(undefined, workflow.policyGet().version, 'helper', { wakeFrom: ['no-reply@other.test'] });
+    t.mock.timers.setTime(activated + 120000);
+    workflow.policyUpdate(undefined, workflow.policyGet().version, 'helper', { wakeFrom: ['no-reply@other.test', 'outside.test'] });
+    const disabledPeriod = message('aa04', 'While domain was disabled', { sender: 'fresh@outside.test', received: activated + 90000 });
+    const fresh = message('aa05', 'After domain reactivation', { sender: 'fresh@outside.test' });
+    h.setFixture(fixture([disabledPeriod, fresh]));
+    await workflow.poll(); await waitFor(() => !workflow.status().working);
+    assert.equal(workflow.inspect(disabledPeriod.id)[0].message.status, 'ignored');
+    assert.deepEqual(covered, [['aa01', 'aa02'], ['aa03'], ['aa05']]);
+    assert.equal(provider.calls(), 0);
+    const nonmatches = ['person@sub.outside.test', 'person@outside.test.attacker.test', 'another@other.test']
+      .map((sender, i) => ({ ...message(`aa1${i}`, 'Not allowlisted', { sender }), threadId: `bb1${i}` }));
+    h.setFixture(separateThreads(nonmatches));
+    await workflow.poll(); await waitFor(() => !workflow.status().working && !workflow.status().triage!.labeling);
+    assert.equal(covered.length, 3, 'domains are exact; individual addresses do not approve their whole domain');
+    for (const item of nonmatches) assert.equal(workflow.inspect(item.id)[0].message.status, 'queue');
+    assert.ok(provider.calls() >= nonmatches.length, 'nonmatches still reach Jev');
+    assert.throws(() => workflow.policyUpdate(undefined, workflow.policyGet().version, 'helper', { wakeFrom: ['not-an-address'] }), /email|domain/);
+  } finally { await workflow.stop(); }
+}));
+
+test('dedicated thread wakes bypass held Jev and serialize later arrivals without duplicate mixed-thread wakes', async () => withHarness(async h => {
+  h.setFixture(fixture([]));
+  let releaseDecision!: () => void, releaseAgent!: () => void;
+  const decisionHeld = new Promise<void>(resolve => { releaseDecision = resolve; });
+  const agentHeld = new Promise<void>(resolve => { releaseAgent = resolve; });
+  let decisionsStarted = 0;
+  const provider = assessments(() => ({ action: { type: 'choice', choice: 'wake', probabilities: {} } }));
+  const decisions: DecisionRuntimeV1 = { evaluate: async (batch, context) => {
+    decisionsStarted++;
+    if ((batch.state as { threadId: string }).threadId === 'bb03') await decisionHeld;
+    return provider.decisions.evaluate(batch, context);
+  } };
+  let workflow: ReturnType<typeof createMailWorkflow>;
+  const runs: Array<{ jobId: string; sessionKey: string; ids: string[] }> = [];
+  workflow = createMailWorkflow({ config: parseConfig({ ...triageConfig(h.config), settings: {
+    wakeFrom: ['notify@outside.test'], concurrency: 2, agentConcurrency: 2,
+  } }), stateDir: h.stateDir, ...provider, decisions, subagent: {
+    async run({ message: prompt, sessionKey }) {
+      const jobId = jobIdFromPrompt(prompt);
+      runs.push({ jobId, sessionKey, ids: workflow.context(jobId, sessionKey).messages.flatMap(item => item.messageIds) });
+      return { runId: jobId };
+    },
+    async waitForRun({ runId }) {
+      const run = runs.find(item => item.jobId === runId)!;
+      if (run === runs[0]) await agentHeld;
+      workflow.complete({ jobId: run.jobId, sessionKey: run.sessionKey, reason: 'Handled' });
+      return { status: 'ok' };
+    },
+  } });
+  let poll: Promise<void> | undefined;
+  try {
+    await workflow.start();
+    const normal = message('aa01', 'Normal work');
+    const otherNormal = { ...message('aa05', 'Other normal work'), threadId: 'bb03' };
+    const matching = { ...message('aa02', 'Explicit notification', { sender: 'notify@outside.test' }), threadId: 'bb02' };
+    const mixed = { ...message('aa03', 'Same conversation, normal sender'), threadId: 'bb02' };
+    const inbox = () => { const f = separateThreads([normal, otherNormal, matching]); f.search.messages.push({ id: mixed.id, threadId: mixed.threadId });
+      f.threads.bb02.thread.messages.push(mixed); return f; };
+    h.setFixture(separateThreads([normal, otherNormal]));
+    poll = workflow.poll();
+    await waitFor(() => decisionsStarted === 2 && workflow.inspect(normal.id)[0].message.status === 'wake');
+    h.setFixture(inbox());
+    await workflow.poll();
+    const db = h.db();
+    try { assert.equal(db.prepare("SELECT count(*) AS n FROM jobs WHERE thread_id='triage'").get()?.n, 0,
+      'admitting new direct mail cannot split the still-running ordinary cycle'); }
+    finally { db.close(); }
+    await waitFor(() => runs.length === 1);
+    assert.deepEqual(runs[0].ids, ['aa02', 'aa03'], 'matching arrival owns the pending mixed conversation before Jev returns');
+    releaseDecision(); await poll;
+    await waitFor(() => runs.length === 2);
+    assert.deepEqual(runs[1].ids, ['aa01', 'aa05'], 'ordinary mail retains its consolidated wake');
+    const later = { ...message('aa04', 'Follow-up notification', { sender: 'notify@outside.test' }), threadId: 'bb02' };
+    const f = inbox(); f.search.messages.push({ id: later.id, threadId: later.threadId }); f.threads.bb02.thread.messages.push(later);
+    h.setFixture(f); await workflow.poll();
+    assert.equal(runs.length, 2, 'same-thread work waits for its active agent');
+    releaseAgent(); await waitFor(() => runs.length === 3 && !workflow.status().working);
+    assert.deepEqual(runs[2].ids, ['aa04']);
+    assert.equal(decisionsStarted, 2, 'Jev never separately reviews the admitted mixed-thread work');
+  } finally { releaseDecision(); releaseAgent(); await poll; await workflow.stop(); }
+}));
+
+test('queued dedicated conversations absorb later normal mail before agent dispatch', async () => withHarness(async h => {
+  h.setFixture(fixture([]));
+  let release!: () => void;
+  const held = new Promise<void>(resolve => { release = resolve; });
+  let workflow: ReturnType<typeof createMailWorkflow>;
+  const runs: Array<{ jobId: string; sessionKey: string; ids: string[] }> = [];
+  const provider = assessments(() => ({ action: { type: 'choice', choice: 'wake', probabilities: {} } }));
+  workflow = createMailWorkflow({ config: parseConfig({ ...triageConfig(h.config), settings: { wakeFrom: ['notify@outside.test'] } }),
+    stateDir: h.stateDir, ...provider, subagent: {
+      async run({ message: prompt, sessionKey }) { const jobId = jobIdFromPrompt(prompt);
+        runs.push({ jobId, sessionKey, ids: workflow.context(jobId, sessionKey).messages.flatMap(item => item.messageIds) });
+        return { runId: jobId }; },
+      async waitForRun({ runId }) { const run = runs.find(item => item.jobId === runId)!;
+        if (run === runs[0]) await held;
+        workflow.complete({ jobId: run.jobId, sessionKey: run.sessionKey, reason: 'Handled' });
+        return { status: 'ok' }; },
+    } });
+  try {
+    await workflow.start();
+    const busy = { ...message('aa01', 'Busy agent', { sender: 'notify@outside.test' }), threadId: 'bb00' };
+    h.setFixture(separateThreads([busy])); await workflow.poll(); await waitFor(() => runs.length === 1);
+    const queued = message('aa02', 'Dedicated notification', { sender: 'notify@outside.test' });
+    h.setFixture(separateThreads([busy, queued])); await workflow.poll();
+    const normal = message('aa03', 'Normal follow-up');
+    const f = separateThreads([busy, queued]); f.threads.bb01.thread.messages.push(normal);
+    f.search.messages.push({ id: normal.id, threadId: normal.threadId });
+    h.setFixture(f); await workflow.poll();
+    assert.equal(provider.calls(), 0, 'queued dedicated ownership admits the undispatched follow-up without Jev');
+    release(); await waitFor(() => !workflow.status().working);
+    assert.deepEqual(runs.map(run => run.ids), [['aa01'], ['aa02', 'aa03']]);
+  } finally { release(); await workflow.stop(); }
+}));
+
+test('live wakeFrom edits suppress in-flight Jev effects and do not retro-wake earlier mail', async t => {
+  for (const boundary of ['classification', 'effect fetch']) await t.test(boundary, async () => withHarness(async h => {
+  const old = message('aa01', 'Before activation', { sender: 'notify@outside.test', received: Date.now() - 60000 });
+  h.setFixture(fixture([old]));
+  let release!: () => void, started = false;
+  const held = new Promise<void>(resolve => { release = resolve; });
+  const provider = assessments(() => ({ action: { type: 'choice', choice: 'delete', probabilities: {} } }));
+  let workflow: ReturnType<typeof createMailWorkflow>;
+  const wakes: string[][] = [];
+  workflow = createMailWorkflow({ config: triageConfig(h.config, { policy: { ...defaultPolicy, deletePrompt: 'Delete notifications' } }),
+    stateDir: h.stateDir, ...provider, decisions: { evaluate: async (batch, context) => { started = true; await held; return provider.decisions.evaluate(batch, context); } }, subagent: {
+      async run({ message: prompt, sessionKey }) { const jobId = jobIdFromPrompt(prompt);
+        wakes.push(workflow.context(jobId, sessionKey).messages.flatMap(item => item.messageIds));
+        workflow.complete({ jobId, sessionKey, reason: 'Handled' }); return { runId: jobId }; },
+      async waitForRun() { return { status: 'ok' }; },
+    } });
+  let initial: Promise<void> | undefined;
+  try {
+    initial = workflow.start(); await waitFor(() => started);
+    if (boundary === 'effect fetch') {
+      h.setFixture({ ...fixture([old]), threadDelayMs: 250 });
+      release();
+      await waitFor(() => h.calls().filter(args => args.includes('thread') && args.includes('get')).length >= 2);
+    }
+    workflow.policyUpdate(undefined, workflow.policyGet().version, 'helper', { wakeFrom: ['outside.test'] });
+    release(); await initial; await workflow.poll();
+    assert.equal(h.calls().some(args => args.includes('modify')), false, 'returned Jev deletion cannot write after the live edit');
+    assert.notEqual(workflow.inspect(old.id)[0].message.status, 'done', 'suppressed deletion is not a completion receipt');
+    assert.equal(wakes.length, 0);
+    const fresh = message('aa02', 'After activation', { sender: 'notify@outside.test' });
+    h.setFixture(fixture([old, fresh])); await workflow.poll(); await waitFor(() => !workflow.status().working);
+    assert.deepEqual(wakes, [['aa02']]);
+    assert.equal(provider.calls(), 1);
+  } finally { release(); await initial; await workflow.stop(); }
+  }));
+});
+
+test('wakeFrom-only installs discover outside senders but retain authentication, self and Gmail scope exclusions', async () => withHarness(async h => {
+  h.setFixture(fixture([]));
+  let workflow: ReturnType<typeof createMailWorkflow>;
+  const wakes: string[][] = [];
+  workflow = createMailWorkflow({ config: parseConfig({ account, gogPath: fakeGog,
+    settings: { wakeFrom: ['outside.test', account], retryDelaySeconds: 0 } }), stateDir: h.stateDir, subagent: {
+      async run({ message: prompt, sessionKey }) { const jobId = jobIdFromPrompt(prompt);
+        wakes.push(workflow.context(jobId, sessionKey).messages.flatMap(item => item.messageIds));
+        workflow.complete({ jobId, sessionKey, reason: 'Handled' }); return { runId: jobId }; },
+      async waitForRun() { return { status: 'ok' }; },
+    } });
+  try {
+    await workflow.start();
+    const good = message('aa01', 'Good', { sender: 'notify@outside.test' });
+    const bad = message('aa02', 'Forged', { sender: 'notify@outside.test', headers: { 'Authentication-Results': 'mx.google.com; dmarc=fail header.from=outside.test' } });
+    const self = message('aa03', 'Self', { sender: account });
+    const excluded = ['SPAM', 'TRASH', 'SENT', 'DRAFT'].map((label, i) => ({
+      ...message(`aa0${i + 4}`, label, { sender: 'notify@outside.test' }), labelIds: ['INBOX', label],
+    }));
+    h.setFixture({ ...fixture([good, bad, self, ...excluded]), threadFailOnce: ['bb01'] });
+    await workflow.poll();
+    assert.equal(workflow.inspect(good.id)[0].message.status, 'pending', 'failed admission remains retryable instead of falling through to reply eligibility');
+    await workflow.poll(); await waitFor(() => !workflow.status().working);
+    assert.deepEqual(wakes, [['aa01']]);
+    assert.ok(h.calls().some(args => args.some(value => value.includes('in:inbox'))), 'outside senders are actually searched');
+  } finally { await workflow.stop(); }
+}));
 
 test('registered service starts without waiting for inference and honors the canonical per-agent model', async () => withHarness(async (h) => {
   const provider = assessments();
@@ -1393,7 +1620,9 @@ test('independent label failures and slow inference cannot block waking; arbitra
     assert.equal(workflow.status().triage!.labeling, true, 'later-cycle wake does not wait for the earlier label request');
     release(); await waitFor(() => !workflow.status().triage!.labeling);
     assert.match(String(workflow.inspect('aa01')[0].labels?.reason), /transport/);
-    await workflow.poll(); await waitFor(() => !workflow.status().triage!.labeling);
+    // Thirteen categories each perform real subprocess reads/writes; this is
+    // completion coverage, not a five-second performance requirement.
+    await workflow.poll(); await waitFor(() => !workflow.status().triage!.labeling, 15000);
     assert.equal(actionCalls, 3); assert.equal(labelAttempts, 3); assert.equal(wakes, 2);
     assert.equal(workflow.inspect('aa01')[0].labels?.status, 'done');
     const creates = h.calls().filter(args => args.includes('create'));

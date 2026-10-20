@@ -16,6 +16,7 @@ export interface StoredMessage {
   discovered: number;
   attempts: number;
   due: number;
+  wake_from: number;
 }
 
 export interface StoredJob {
@@ -70,7 +71,7 @@ export class MailState {
     `);
     // Additive migration: never rewrite prior jobs, receipts, or activation cutoffs.
     for (const [table, columns] of Object.entries({
-      messages: { attempts: "INTEGER NOT NULL DEFAULT 0", due: "INTEGER NOT NULL DEFAULT 0" },
+      messages: { attempts: "INTEGER NOT NULL DEFAULT 0", due: "INTEGER NOT NULL DEFAULT 0", wake_from: "INTEGER NOT NULL DEFAULT 0" },
       jobs: { agent_id: "TEXT NOT NULL DEFAULT ''", session_key: "TEXT NOT NULL DEFAULT ''", run_id: "TEXT NOT NULL DEFAULT ''", evidence_hash: "TEXT NOT NULL DEFAULT ''", policy_version: "INTEGER NOT NULL DEFAULT 0", started: "INTEGER NOT NULL DEFAULT 0" },
       policies: { settings: "TEXT NOT NULL DEFAULT '{}'" },
     })) {

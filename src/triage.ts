@@ -1,6 +1,6 @@
 import type { DecisionBatch, DecisionOutcome, DecisionRuntimeV1 } from "openclaw/plugin-sdk/decisions";
 import { evidence, fitEvidence } from "./evidence.js";
-import { mailCutoff, threadFacts, type GmailMessage, type GmailThread, type MailConfig } from "./mail.js";
+import { mailCutoff, senderAddress, threadFacts, type GmailMessage, type GmailThread, type MailConfig } from "./mail.js";
 import { hash, type Action, type PolicyStore } from "./policy.js";
 import type { MailState } from "./state.js";
 
@@ -30,6 +30,8 @@ export function createTriage(options: {
   const { config, state, mail, signal, policies } = options;
   const settings = config.triage!;
   const policy = policies.get;
+  const bypassesTriage = (message: GmailMessage) => policies.wakeFromSince(senderAddress(message)) !== undefined ||
+    state.message(message.id)?.wake_from === 1;
   function assertCurrent(version: number, kind: "action" | "labels") {
     const relevant = (snapshot: ReturnType<typeof policy>) =>
       kind === "labels" ? snapshot.document.labels : [snapshot.document.prompt, snapshot.document.deletePrompt];
@@ -107,6 +109,10 @@ export function createTriage(options: {
       const target = thread.messages.find(message => message.id === row.id);
       signal.throwIfAborted();
       if (!target || evidence(thread).hash !== row.evidence_hash) throw new Error("mail changed before effect; retry");
+      if (kind !== "historical" && bypassesTriage(target)) {
+        if (kind === "backlog") throw new Error("wakeFrom policy changed before deletion; retry routing");
+        return;
+      }
       if (kind === "labels" && Number(target.internalDate) < mailCutoff(policies.settings().maxAgeDays)) return;
       if (!remove.length && target.labelIds.includes("TRASH")) return;
       const applied = add.every(label => target.labelIds.includes(label)) && remove.every(label => !target.labelIds.includes(label));
@@ -142,7 +148,7 @@ export function createTriage(options: {
       const target = thread.messages.find(message => message.id === id);
       if (!target) throw new Error("label target missing");
       return target;
-    }).filter(target => !target.labelIds.includes("TRASH") && Number(target.internalDate) >= mailCutoff(policies.settings().maxAgeDays));
+    }).filter(target => !bypassesTriage(target) && !target.labelIds.includes("TRASH") && Number(target.internalDate) >= mailCutoff(policies.settings().maxAgeDays));
     if (!targets.length) return;
     const source = evidence(thread);
     const today = dateContext();
@@ -158,6 +164,9 @@ export function createTriage(options: {
     const key = hash({ source: source.hash, model: settings.decisionModel, questions,
       limits: [limits.maxInputTokens, limits.maxRequestTokens], rubric: "thread-labels-v2" });
     const answers = await evaluate(batch, "gog-email-watch.labels", key);
+    const eligible = () => targets.filter(target => !bypassesTriage(target) &&
+      state.db.prepare("SELECT status FROM label_work WHERE id=?").get(target.id)?.status === "pending");
+    if (!eligible().length) return;
     const names = current.document.labels.filter((_, i) => {
       const answer = answers[`label_${i}`];
       if (answer?.type !== "choice" || !["apply", "skip"].includes(answer.choice)) throw new Error("invalid label response");
@@ -166,9 +175,10 @@ export function createTriage(options: {
     const errors: string[] = [];
     for (const name of names) {
       try {
+        if (!eligible().length) break;
         const label = await mail.labelId(name);
         assertCurrent(current.version, "labels");
-        for (const { id } of targets) {
+        for (const { id } of eligible()) {
           if (state.db.prepare("SELECT status FROM label_work WHERE id=?").get(id)?.status !== "pending") continue;
           await effect({ id, thread_id: threadId, evidence_hash: source.hash, policy_version: current.version }, [label], [], "labels");
         }

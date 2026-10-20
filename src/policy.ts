@@ -1,11 +1,12 @@
 import { createHash } from "node:crypto";
 import { Type, type Static } from "@sinclair/typebox";
 import { Value } from "@sinclair/typebox/value";
-import type { MailConfig } from "./mail.js";
+import { parseWakeFrom, type MailConfig } from "./mail.js";
 import type { MailState } from "./state.js";
 
 const object = { additionalProperties: false } as const;
 export const SettingsSchema = Type.Partial(Type.Object({
+  wakeFrom: Type.Array(Type.String(), { default: [], description: "Email addresses or exact domains (e.g. person@example.com or example.com) whose new inbox mail bypasses Jev and wakes per thread. No implicit subdomains or reply permission." }),
   replyAllowed: Type.Boolean({ default: true, description: "Allow in-thread replies in responder and triage jobs. Existing approved-sender and recipient checks still apply. Live-editable; false disables sends." }),
   wakePrompt: Type.String({ default: "", description: "Additional instructions for the awakened triage agent, not Jev." }),
   responderPrompt: Type.String({ default: "", description: "Additional instructions for new-mail responder jobs." }),
@@ -32,6 +33,7 @@ export const SettingsSchema = Type.Partial(Type.Object({
 export type SettingsPatch = Static<typeof SettingsSchema>;
 type StoredSettings = Required<Omit<SettingsPatch, "evidence">>;
 export const defaultSettings: StoredSettings = {
+  wakeFrom: [],
   replyAllowed: true,
   agentConcurrency: 1,
   wakePrompt: "", responderPrompt: "", pollIntervalSeconds: 120, concurrency: 50, labelConcurrency: null,
@@ -41,7 +43,7 @@ export const defaultSettings: StoredSettings = {
 };
 export function parseSettings(value: unknown): SettingsPatch {
   if (!Value.Check(SettingsSchema, value)) throw new Error("invalid email runtime settings");
-  return structuredClone(value);
+  return { ...structuredClone(value), ...(value.wakeFrom === undefined ? {} : { wakeFrom: parseWakeFrom(value.wakeFrom) }) };
 }
 function mergeSettings(base: StoredSettings, patch: SettingsPatch): StoredSettings {
   const { evidence: _legacy, ...settings } = patch;
@@ -114,6 +116,13 @@ export function createPolicyStore(config: MailConfig, state: MailState) {
     const snapshot = read(version);
     return { ...snapshot, configuredSettings: snapshot.settings, settings: effectiveSettings(snapshot.settings) };
   }
+  // Overlapping address/domain rules retain the earliest continuously active
+  // route. Adding a narrower rule must not reset an existing domain's cutoff.
+  function wakeFromSince(sender: string): number | undefined {
+    const domain = sender.split("@")[1];
+    const rules = get().settings.wakeFrom.filter(rule => rule === sender || rule === domain);
+    return rules.length ? Math.min(...rules.map(rule => Number(state.meta(`wakeFrom:${rule}`) ?? Date.now()))) : undefined;
+  }
   function replan(previous: Snapshot | undefined, next: Snapshot) {
     if (!config.triage) return;
     if (previous?.settings.maxAgeDays !== next.settings.maxAgeDays)
@@ -130,6 +139,11 @@ export function createPolicyStore(config: MailConfig, state: MailState) {
       state.db.prepare("UPDATE label_work SET status='pending',due=0").run();
   }
   function save(snapshot: Snapshot, actor: string) {
+    const active = new Set(snapshot.settings.wakeFrom.map(rule => `wakeFrom:${rule}`));
+    for (const { key } of state.db.prepare("SELECT key FROM meta WHERE key LIKE 'wakeFrom:%'").all()) {
+      if (!active.has(String(key))) state.db.prepare("DELETE FROM meta WHERE key=?").run(key);
+    }
+    for (const key of active) if (!state.meta(key)) state.setMeta(key, Date.now());
     state.db.prepare("INSERT INTO policies(version,document,created,editor,settings) VALUES (?,?,?,?,?)")
       .run(snapshot.version, JSON.stringify(snapshot.document), now(), actor, JSON.stringify(snapshot.settings));
   }
@@ -140,12 +154,12 @@ export function createPolicyStore(config: MailConfig, state: MailState) {
   const policyChanged = config.triage && state.meta("triage_config_policy") !== policyHash;
   const threadMigration = config.triage && state.meta("triage_unit") !== "rolling-thread";
   // Recognize the old file fingerprint without resetting persisted live overrides.
-  const { replyAllowed: _reply, agentConcurrency: _agents, ...v036Settings } = configuredSettings;
+  const { replyAllowed: _reply, agentConcurrency: _agents, wakeFrom: _wakeFrom, ...v036Settings } = configuredSettings;
   const { maxAgeDays: _age, maxInputTokens: _input, maxRequestTokens: _request, ...previousSettings } = v036Settings;
   const legacySettingsHash = hash({ ...previousSettings, evidence: { maxBytes: 16_000, context: "thread", ...config.settings?.evidence } });
   const newOverrides = ["maxAgeDays", "maxInputTokens", "maxRequestTokens"].some(key => key in (config.settings ?? {}));
   const oldFingerprint = state.meta("runtime_config_settings");
-  const unchangedLegacySettings = !["replyAllowed", "agentConcurrency"].some(key => key in (config.settings ?? {})) &&
+  const unchangedLegacySettings = !["replyAllowed", "agentConcurrency", "wakeFrom"].some(key => key in (config.settings ?? {})) &&
     (oldFingerprint === hash(v036Settings) || (!newOverrides &&
       (oldFingerprint === hash(previousSettings) || oldFingerprint === legacySettingsHash)));
   const settingsChanged = oldFingerprint !== settingsHash && !unchangedLegacySettings;
@@ -182,7 +196,7 @@ export function createPolicyStore(config: MailConfig, state: MailState) {
       return get();
     });
   }
-  return { get, update, settings: () => get().settings };
+  return { get, update, settings: () => get().settings, wakeFromSince };
 }
 export type PolicyStore = ReturnType<typeof createPolicyStore>;
 

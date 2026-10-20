@@ -1,7 +1,7 @@
 {
   "id": "gog-email-watch",
   "name": "Gog Email Watch",
-  "version": "0.3.7",
+  "version": "0.3.8",
   "description": "Rolling recent-inbox wake/queue/skip/delete triage, independent labels and optional approved-sender responses.",
   "activation": {
     "onStartup": true
@@ -151,6 +151,14 @@
         "additionalProperties": false,
         "type": "object",
         "properties": {
+          "wakeFrom": {
+            "default": [],
+            "description": "Email addresses or exact domains (e.g. person@example.com or example.com) whose new inbox mail bypasses Jev and wakes per thread. No implicit subdomains or reply permission.",
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
           "replyAllowed": {
             "default": true,
             "description": "Allow in-thread replies in responder and triage jobs. Existing approved-sender and recipient checks still apply. Live-editable; false disables sends.",

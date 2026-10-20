@@ -10,6 +10,7 @@ import { concurrently, createPolicyStore } from "./policy.js";
 import {
   GogMailClient,
   eligibility,
+  wakeFromEligibility,
   mailCutoff,
   explicitExternalRecipients,
   isGmailId,
@@ -92,7 +93,9 @@ export function createMailWorkflow(options: WorkflowOptions) {
   const triage = config.triage ? createTriage({ config, state, mail, policies, signal: abort.signal,
     mutate: work => withMailbox("mutation", work), decisions: options.decisions, decisionModel: options.decisionModel }) : undefined;
   let timer: ReturnType<typeof setInterval> | undefined;
-  let polling = false;
+  let polling = 0;
+  let admitting = false;
+  let classifying = false;
   const workers = new Map<string, { jobId?: string; threadIds: string[] }>();
   let sending = 0;
   let scanning = false;
@@ -198,15 +201,44 @@ export function createMailWorkflow(options: WorkflowOptions) {
         for (const item of messages) {
           if (!isGmailId(item.id) || !isGmailId(item.threadId)) throw new Error("invalid Gmail identifiers");
           insert.run(item.id, item.threadId, seconds());
-          if (triage) state.db.prepare("UPDATE messages SET status='pending',due=0 WHERE id=? AND status='ignored' AND job_id IS NULL").run(item.id);
+          if (triage && policies.wakeFromSince(state.message(item.id)!.sender) === undefined)
+            state.db.prepare("UPDATE messages SET status='pending',due=0 WHERE id=? AND status='ignored' AND job_id IS NULL").run(item.id);
         }
       });
     }
   }
 
+  function admitThread(thread: GmailThread, rows: StoredMessage[], oldest: number) {
+    rows = rows.filter(row => state.message(row.id)?.status === "pending");
+    const dedicated = rows.some(row => {
+      const message = thread.messages.find(item => item.id === row.id);
+      const since = message ? policies.wakeFromSince(senderAddress(message)) : undefined;
+      return message && (row.wake_from === 1 ||
+        (since !== undefined && Number(message.internalDate) >= oldest &&
+          wakeFromEligibility(message, config, since).accepted));
+    });
+    for (const row of rows) {
+      const message = thread.messages.find(item => item.id === row.id);
+      if (!message) continue;
+      const sender = senderAddress(message);
+      state.db.prepare("UPDATE messages SET received=?,sender=? WHERE id=?").run(Number(message.internalDate), sender, row.id);
+      const activated = policies.wakeFromSince(sender);
+      if (!dedicated && activated === undefined) continue;
+      const since = row.wake_from === 1 ? 0 : activated ?? 0;
+      const verdict = Number(message.internalDate) < oldest ? { accepted: false, reason: "older than maxAgeDays" }
+        : wakeFromEligibility(message, config, since);
+      state.db.prepare("UPDATE label_work SET status='cancelled',reason='wakeFrom bypass' WHERE id=?").run(row.id);
+      state.db.prepare("UPDATE messages SET status=?,reason=?,due=0,wake_from=? WHERE id=? AND status='pending'")
+        .run(verdict.accepted ? "queued" : "ignored", verdict.reason, Number(verdict.accepted), row.id);
+    }
+  }
+
   async function poll(): Promise<void> {
-    if (stopped || polling) return;
-    polling = true;
+    if (stopped || admitting) return;
+    admitting = true;
+    let ownsAdmission = true;
+    let ownsClassification = false;
+    polling++;
     try {
       const now = seconds();
       const since = Number(state.meta("active_since") ?? 0);
@@ -225,6 +257,7 @@ export function createMailWorkflow(options: WorkflowOptions) {
           state.setMeta("triage_discovered", now);
         }
         await discover(Math.max(after, Math.floor(oldest / 1000)), triage ? "inbox" : "approved");
+        if (!triage && settings.wakeFrom.length) await discover(Math.max(after, Math.floor(oldest / 1000)), "inbox");
       });
       state.setMeta("last_poll", now);
       if (reconcile) state.setMeta("last_reconcile", now);
@@ -232,16 +265,51 @@ export function createMailWorkflow(options: WorkflowOptions) {
       state.db.prepare("UPDATE messages SET status='pending' WHERE status='deferred' AND due<=?").run(now);
       // New evidence replaces waiting work for the whole conversation. Detaching
       // undispatched reservations leaves running/completed jobs untouched.
-      if (triage) state.db.prepare(`UPDATE messages SET status='pending',due=0
+      state.db.prepare(`UPDATE messages SET status='pending',due=0
         WHERE thread_id IN (SELECT thread_id FROM messages WHERE status='pending' AND due<=?)
-          AND (status IN ('pending','queue','wake') OR (status='processing' AND job_id IN
+          AND thread_id NOT IN (SELECT value FROM json_each(?))
+          AND (status IN ('pending','queue','wake') OR (status='queued' AND wake_from=1) OR (status='processing' AND job_id IN
             (SELECT id FROM jobs WHERE thread_id='triage' AND status='queued')))`
-      ).run(now);
+      ).run(now, JSON.stringify([...workers.values()].flatMap(worker => worker.threadIds)));
       const pending = state.db.prepare("SELECT * FROM messages WHERE status='pending' AND due<=? ORDER BY discovered,id").all(now) as unknown as StoredMessage[];
+      const failedAdmission = new Set<string>();
+      // Only explicit notification installs need a separate admission pass.
+      // Retain no conversation evidence between workers or across the inbox.
+      if (policies.settings().wakeFrom.length || pending.some(row => row.wake_from === 1)) {
+        await concurrently(byThread(pending), settings.concurrency, async rows => {
+          try {
+            const thread = await mail.getThread(rows[0].thread_id);
+            if (stopped) return;
+            admitThread(thread, rows, oldest);
+            void processNext().catch(error => logger?.error(`gog-email-watch: worker failed: ${safeError(error)}`));
+          } catch (error) {
+            if (stopped) return;
+            failedAdmission.add(rows[0].thread_id);
+            for (const row of rows) state.db.prepare("UPDATE messages SET attempts=attempts+1,due=?,reason=? WHERE id=? AND status='pending'")
+              .run(now + settings.retryDelaySeconds, safeError(error), row.id);
+          }
+        });
+      }
+      // Preserve one consolidated ordinary cycle. Later polls can still admit
+      // and dispatch dedicated mail while this batch awaits inference.
+      admitting = false;
+      ownsAdmission = false;
+      void processNext().catch(error => logger?.error(`gog-email-watch: worker failed: ${safeError(error)}`));
+      if (classifying) return;
+      classifying = true;
+      ownsClassification = true;
       await concurrently(byThread(pending), settings.concurrency, async rows => {
+        const threadId = rows[0].thread_id;
+        if (failedAdmission.has(threadId)) return;
+        rows = rows.filter(row => state.message(row.id)?.status === "pending");
+        if (!rows.length) return;
         if (stopped) return;
         try {
-          const thread = await mail.getThread(rows[0].thread_id);
+          const thread = await mail.getThread(threadId);
+          if (stopped) return;
+          admitThread(thread, rows, oldest);
+          rows = rows.filter(row => state.message(row.id)?.status === "pending");
+          if (!rows.length) return;
           const messages = new Map(thread.messages.map(message => [message.id, message]));
           const results = await assessInbox(thread, triage ? rows : []);
           if (stopped) return;
@@ -278,7 +346,9 @@ export function createMailWorkflow(options: WorkflowOptions) {
       state.setMeta("last_poll_error_at", seconds());
       throw error;
     } finally {
-      polling = false;
+      if (ownsAdmission) admitting = false;
+      if (ownsClassification) classifying = false;
+      polling--;
       finishStopIfIdle();
     }
   }
@@ -289,6 +359,10 @@ export function createMailWorkflow(options: WorkflowOptions) {
     const targets: GmailMessage[] = [];
     for (const row of rows) {
       const message = thread.messages.find(message => message.id === row.id);
+      if (message && (state.message(row.id)?.wake_from === 1 || policies.wakeFromSince(senderAddress(message)) !== undefined)) {
+        results.set(row.id, { status: "pending", reason: "wakeFrom policy changed" });
+        continue;
+      }
       const unfinishedDelete = !!state.db.prepare("SELECT 1 FROM effects WHERE message_id=? AND status!='confirmed' AND instr(intent,'TRASH')>0").get(row.id);
       if (!message || (!message.labelIds.includes("INBOX") && !unfinishedDelete) || message.labelIds.some(label => ["SPAM", "SENT", "DRAFT"].includes(label)) ||
         (message.labelIds.includes("TRASH") && !unfinishedDelete)) results.set(row.id, { status: "ignored", reason: "no longer in the triage inbox" });
@@ -308,6 +382,11 @@ export function createMailWorkflow(options: WorkflowOptions) {
       }
       for (const row of result.rows) {
         try {
+          const message = thread.messages.find(message => message.id === row.id);
+          if (message && (state.message(row.id)?.wake_from === 1 || policies.wakeFromSince(senderAddress(message)) !== undefined)) {
+            results.set(row.id, { status: "pending", reason: "wakeFrom policy changed" });
+            continue;
+          }
           if (result.action === "delete") await service.deleteMail(row);
           else service.scheduleLabels(row.id, row.thread_id);
           results.set(row.id, { status: result.action === "delete" ? "done" : result.action === "skip" ? "skipped" : result.action === "wake" ? "wake" : "queue", reason: result.action });
@@ -326,6 +405,11 @@ export function createMailWorkflow(options: WorkflowOptions) {
       const settings = policies.settings();
       const rows = state.db.prepare("SELECT id,thread_id FROM label_work WHERE status='pending' AND due<=?").all(seconds()) as Array<{ id: string; thread_id: string }>;
       await concurrently(byThread(rows), settings.labelConcurrency, async group => {
+        group = group.filter(row => {
+          const message = state.message(row.id);
+          return message && policies.wakeFromSince(message.sender) === undefined && message.wake_from !== 1;
+        });
+        if (!group.length) return;
         if (stopped) return;
         try {
           await triage.label(group.map(row => row.id), group[0].thread_id);
@@ -446,7 +530,8 @@ Use gog_email_context for the authorized job snapshot. If work is finished witho
       for (const row of rows) {
         const message = available.get(row.id);
         const verdict = message ? (Number(message.internalDate) < mailCutoff(policies.settings().maxAgeDays)
-          ? { accepted: false, reason: "older than maxAgeDays" } : eligibility(message, config, cutoffs(), thread))
+          ? { accepted: false, reason: "older than maxAgeDays" } : row.wake_from === 1
+            ? wakeFromEligibility(message, config, 0) : eligibility(message, config, cutoffs(), thread))
           : { accepted: false, reason: "message-no-longer-present" };
         if (verdict.accepted) valid.push(row);
         else rejected.push({ id: row.id, reason: verdict.reason });
@@ -550,8 +635,8 @@ Use gog_email_context for the authorized job snapshot. If work is finished witho
           const changed = rows.filter(row => {
             const target = thread.messages.find(message => message.id === row.id);
             const prior = state.db.prepare("SELECT evidence_hash FROM triage WHERE id=?").get(row.id);
-            return reserved(row.id) && !(target && Number(target.internalDate) >= mailCutoff(policies.settings().maxAgeDays) &&
-              target.labelIds.includes("INBOX") && !target.labelIds.some(label => ["SPAM", "TRASH", "SENT", "DRAFT"].includes(label)) && prior?.evidence_hash === fingerprint);
+            return reserved(row.id) && ((target && policies.wakeFromSince(senderAddress(target)) !== undefined) || !(target && Number(target.internalDate) >= mailCutoff(policies.settings().maxAgeDays) &&
+              target.labelIds.includes("INBOX") && !target.labelIds.some(label => ["SPAM", "TRASH", "SENT", "DRAFT"].includes(label)) && prior?.evidence_hash === fingerprint));
           });
           const results = await assessInbox(thread, changed);
           for (const row of changed) {
@@ -891,7 +976,7 @@ ${policies.settings().wakePrompt}`.trimEnd(), ["gog_email_reply", "gog_email_con
       activeSince: Number(state.meta("active_since") ?? 0),
       lastPoll: Number(state.meta("last_poll") ?? 0),
       lastPollError: state.meta("last_poll_error") ?? "",
-      polling,
+      polling: polling > 0,
       working: workers.size > 0,
       settings: policies.settings(),
       messages: state.counts("messages"),

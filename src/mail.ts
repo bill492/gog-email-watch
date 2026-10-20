@@ -99,6 +99,18 @@ function addressList(value: unknown, name: string): string[] {
   return [...new Set(value.map((item) => address(item)))];
 }
 
+function senderDomain(value: string): string {
+  const domain = value.trim().toLowerCase();
+  if (!/^[a-z0-9](?:[a-z0-9.-]*[a-z0-9])?$/.test(domain) || !domain.includes(".") || domain.includes("..")) {
+    throw new Error("invalid sender domain");
+  }
+  return domain;
+}
+
+export function parseWakeFrom(rules: readonly string[]): string[] {
+  return [...new Set(rules.map(rule => rule.includes("@") ? address(rule) : senderDomain(rule)))];
+}
+
 export function parseConfig(value: unknown): MailConfig {
   const raw = record(value);
   if (typeof raw.account !== "string") throw new Error("account is required");
@@ -107,12 +119,10 @@ export function parseConfig(value: unknown): MailConfig {
   if (!Array.isArray(configuredDomains) || !configuredDomains.every((item) => typeof item === "string")) {
     throw new Error("domains must be a list");
   }
-  const domains = [...new Set(configuredDomains.map((item) => item.toLowerCase()))];
-  if (domains.some((domain) => !/^[a-z0-9](?:[a-z0-9.-]*[a-z0-9])?$/.test(domain) || !domain.includes(".") || domain.includes(".."))) {
-    throw new Error("invalid sender domain");
-  }
+  const domains = [...new Set(configuredDomains.map(senderDomain))];
   const senders = addressList(raw.senders ?? [], "senders");
-  if (!domains.length && !senders.length && !raw.triage) throw new Error("configure at least one domain or sender, or enable triage");
+  const settings = parseSettings(raw.settings ?? {});
+  if (!domains.length && !senders.length && !settings.wakeFrom?.length && !raw.triage) throw new Error("configure at least one domain, sender or wakeFrom rule, or enable triage");
   const selfAddresses = [...new Set([account, ...addressList(raw.selfAddresses ?? [], "selfAddresses")])];
   const agentId = raw.agentId ?? "main";
   const pollIntervalSeconds = raw.pollIntervalSeconds ?? 120;
@@ -122,7 +132,7 @@ export function parseConfig(value: unknown): MailConfig {
     throw new Error("pollIntervalSeconds must be a positive integer");
   }
   if (typeof gogPath !== "string" || !gogPath.trim()) throw new Error("gogPath must be nonempty");
-  return { account, domains, senders, agentId, pollIntervalSeconds, gogPath, selfAddresses, triage: parseTriage(raw.triage), settings: parseSettings(raw.settings ?? {}) };
+  return { account, domains, senders, agentId, pollIntervalSeconds, gogPath, selfAddresses, triage: parseTriage(raw.triage), settings };
 }
 
 function headers(message: GmailMessage | { payload: GmailPart }): Map<string, string[]> {
@@ -218,6 +228,16 @@ export function eligibility(message: GmailMessage, config: MailConfig, cutoffs: 
   if (automation) return { accepted: false, reason: automation, sender };
   if (authentication) return { accepted: false, reason: authentication, sender };
   return { accepted: true, reason: externalReply && !config.domains.includes(domain) && !config.senders.includes(sender) ? "external-conversation-reply" : "internal", sender };
+}
+
+/** Explicit notification permission, never reply authority. Listed bots are intentional. */
+export function wakeFromEligibility(message: GmailMessage, config: MailConfig, since: number): Eligibility {
+  const { sender, authentication } = senderSignals(message);
+  const reason = !sender ? "invalid-sender" : config.selfAddresses.includes(sender) ? "self"
+    : !message.labelIds.includes("INBOX") || message.labelIds.some(label => excludedLabels.has(label)) ? "excluded-label"
+    : Number(message.internalDate) < since ? "before-wakeFrom-activation"
+    : authentication ?? "wakeFrom";
+  return { accepted: reason === "wakeFrom", reason, sender };
 }
 
 function parseVisibleAddresses(values: readonly string[]): string[] {

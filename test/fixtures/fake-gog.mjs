@@ -41,6 +41,12 @@ if (command[1] === 'messages' && command[2] === 'search') {
       fixture.threads?.[threadId]?.thread.messages.some(message => message.id === id && message.labelIds.includes('INBOX'))) };
   }
 } else if (command[1] === 'thread' && command[2] === 'get') {
+  if (fixture.threadFailOnce?.includes(command[3])) {
+    let first = false;
+    try { writeFileSync(`${process.env.GOG_TEST_CALLS}.failed-${command[3]}`, '', { flag: 'wx' }); first = true; }
+    catch (error) { if (error.code !== 'EEXIST') throw error; }
+    if (first) { process.stderr.write('controlled transient thread read failure\n'); process.exit(1); }
+  }
   if (fixture.threadDelayMs) await new Promise(resolve => setTimeout(resolve, fixture.threadDelayMs));
   result = fixture.threads?.[command[3]];
 } else if (command[1] === 'send') {

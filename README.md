@@ -21,6 +21,41 @@ SQLite persists discovery, classifications, pending work, agent jobs and effect
 receipts. One service uses OpenClaw's Decisions and subagent runtimes; there is
 no separate scheduler, provider transport or generic queue framework.
 
+### Guaranteed sender wakes
+
+Set `settings.wakeFrom` to an array of email addresses and/or domains (default
+`[]`), in file configuration or with `gog_email_policy_update`, for example:
+
+```json
+{ "settings": { "wakeFrom": ["unblocklabs.ai", "person@example.com"] } }
+```
+
+Entries are normalized to lowercase and validated. A domain matches every sender
+at that exact domain, not its subdomains; add subdomains explicitly if wanted.
+New matching inbox mail bypasses Jev entirely,
+including label classification, and wakes a dedicated agent per Gmail thread.
+Explicitly listed automated senders are supported. Gmail authentication,
+self-mail, Spam/Trash/Sent/Draft exclusions and the age rule still apply.
+
+Each address/domain rule activates when first configured. Existing mail from before
+that moment does not wake retroactively; removing and re-adding a rule starts a
+new activation window. Overlapping rules use the earliest continuously active
+match. Activation and message-ID dedup survive restarts.
+Multiple pending messages in the same conversation share one wake, including
+undispatched normal work already waiting for that thread. Running work is never
+stolen; same-thread jobs run sequentially, and genuinely later arrivals can
+create follow-up work. Unrelated slow Jev inference does not hold up admission
+or dispatch of these wakes (available agent capacity still applies).
+An earlier uncertain run marked `needs_review` still holds later work on that
+thread until its outcome is reconciled; `wakeFrom` does not bypass this safety hold.
+
+`wakeFrom` grants notification eligibility only. Existing `senders`/`domains`,
+authentication and recipient protections still govern replies. Dedicated wakes
+use `settings.responderPrompt`; ordinary Jev wakes remain consolidated per cycle.
+Later nonmatching mail still goes through Jev with the full conversation as
+context, which may include earlier matching mail. Explicit historical deletion
+scans are unchanged and can evaluate matching mail for deletion.
+
 ## Agent quickstart
 
 1. **Already installed?** Call `gog_email_policy_get` and `gog_email_status` with
@@ -102,7 +137,7 @@ All paths in the following tables are relative to
 | `triage` | Object; omitted | Enables rolling recent/new-inbox triage. Omit for responder-only operation. |
 | `settings` | Object; `{}` | Runtime overrides listed below; omitted fields use defaults/fallbacks. |
 
-At least one of `domains` or `senders` must be nonempty unless triage is enabled.
+At least one of `domains`, `senders` or `settings.wakeFrom` must be nonempty unless triage is enabled.
 With triage enabled, both can be empty. These lists
 control the responder and reply authorization, not which inbox mail Jev
 classifies. Addresses and domains are normalized to lowercase.
@@ -395,6 +430,7 @@ host/provider/platform constraints.
 | Setting | Type / default | Behavior |
 | --- | --- | --- |
 | `replyAllowed` | Boolean; `true` | Enable replies in triage and responder jobs. `false` disables sends without suppressing wakes. Live-editable; existing sender, recipient and duplicate-send checks remain. |
+| `wakeFrom` | Email-address/domain array; `[]` | New inbox mail matching any exact address or domain bypasses Jev actions/labels and wakes per thread. Notification permission only; see [Guaranteed sender wakes](#guaranteed-sender-wakes). |
 | `wakePrompt` | String; `""` | Trusted snippet appended to the awakened triage agent's instructions, not sent to Jev. |
 | `responderPrompt` | String; `""` | Trusted snippet appended to new-mail responder instructions. |
 | `pollIntervalSeconds` | Integer >= 1; `120` | Live changes reschedule polling without restarting the Gateway. |

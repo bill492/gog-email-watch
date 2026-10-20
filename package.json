@@ -1,6 +1,6 @@
 {
   "name": "@unblocklabs/gog-email-watch",
-  "version": "0.3.6",
+  "version": "0.3.7",
   "license": "MIT",
   "description": "Rolling recent-inbox wake/queue/skip/delete triage, independent labels, and approved-sender agent workflows through gog.",
   "type": "module",

@@ -123,8 +123,12 @@ export class MailState {
     return !!this.db.prepare("SELECT 1 FROM replies WHERE job_id=? LIMIT 1").get(id);
   }
 
-  hasReplyTarget(key: string): boolean {
-    return !!this.db.prepare("SELECT 1 FROM replies WHERE target_id=?").get(key);
+  hasUncertainReplyForJob(id: string): boolean {
+    return !!this.db.prepare("SELECT 1 FROM replies WHERE job_id=? AND status!='sent' LIMIT 1").get(id);
+  }
+
+  replyForTarget(key: string): { status: string } | undefined {
+    return this.db.prepare("SELECT status FROM replies WHERE target_id=? OR substr(target_id,1,length(?)+1)=? || ':' LIMIT 1").get(key, key, key) as { status: string } | undefined;
   }
 
   counts(table: "messages" | "jobs"): Record<string, number> {

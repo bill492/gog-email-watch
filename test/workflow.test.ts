@@ -222,11 +222,12 @@ test('policy tools support ordinary and delegated agents without owner context w
       assert.ok(saved.details && typeof saved.details === 'object' && 'document' in saved.details);
       assert.deepEqual(saved.details.document, policy);
       assert.equal(saved.details.document.queueMinutes, 0.5, 'sub-minute intervals are supported');
-      await update.execute('settings', { expectedVersion: version, settings: { wakePrompt: `Instructions from ${sessionKey}`, concurrency: 7, labelConcurrency: 2 } });
+      await update.execute('settings', { expectedVersion: version, settings: { wakePrompt: `Instructions from ${sessionKey}`, concurrency: 7, labelConcurrency: 2, replyAllowed: false } });
       version++;
       const runtime = await agentTools.find(tool => tool.name === 'gog_email_policy_get')!.execute('read-settings', {});
       assert.ok(runtime.details && typeof runtime.details === 'object' && 'settings' in runtime.details);
       assert.equal((runtime.details.settings as { labelConcurrency: number }).labelConcurrency, 2);
+      assert.equal((runtime.details.settings as { replyAllowed: boolean }).replyAllowed, false);
       await assert.rejects(update.execute('empty', { expectedVersion: version }), /invalid|provide/);
     }
   } finally { await service.stop?.(context); }
@@ -578,8 +579,10 @@ test('in-flight settings edits preserve decisions, independent worker capacities
   } finally { releaseActions(); releaseLabels(); await start; await workflow.stop(); }
 }));
 
-test('host-pending runs remain active until the responder or triage agent completes', async t => {
-  for (const triage of [false, true]) await t.test(triage ? 'triage' : 'responder', async () => withHarness(async h => {
+test('host-pending runs survive observation failures until an actual terminal outcome', async t => {
+  for (const triage of [false, true]) for (const terminalTimeout of [false, true])
+    await t.test(`${triage ? 'triage' : 'responder'}: ${terminalTimeout ? 'host timeout' : 'completed'}`, async t => withHarness(async h => {
+    t.mock.timers.enable({ apis: ['Date'], now: Date.now() });
     h.setFixture(fixture([]));
     let workflow: ReturnType<typeof createMailWorkflow>, jobId = '', sessionKey = '', runs = 0, waits = 0;
     const provider = assessments(() => ({ action: { type: 'choice', choice: 'wake', probabilities: {} } }));
@@ -588,8 +591,13 @@ test('host-pending runs remain active until the responder or triage agent comple
       subagent: {
         run: async input => { runs++; jobId = jobIdFromPrompt(input.message); sessionKey = input.sessionKey; return { runId: jobId, sessionKey }; },
         waitForRun: async () => {
-          if (++waits === 1) return { status: 'pending' };
+          if (++waits <= 2) {
+            t.mock.timers.setTime(Date.now() + 700000);
+            return { status: waits === 1 ? 'pending' : 'timeout' };
+          }
+          if (waits === 3) return { status: 'error', error: 'connection closed', retryableTransportError: true };
           workflow.context(jobId, sessionKey);
+          if (terminalTimeout) return triage ? { status: 'timeout', timeoutPhase: 'provider' } : { status: 'timeout', providerStarted: true };
           workflow.complete({ jobId, sessionKey, reason: 'Host queue drained; work completed' });
           return { status: 'ok' };
         },
@@ -598,9 +606,14 @@ test('host-pending runs remain active until the responder or triage agent comple
       await workflow.start();
       if (!triage) { h.setFixture(fixture([message('aa01', 'New mail')])); await workflow.poll(); }
       await waitFor(() => !workflow.status().working);
-      assert.equal(workflow.status().jobs.completed, 1, 'pending is not a failed or unresolved run');
-      assert.equal(workflow.status().messages.done, 1);
-      assert.equal(runs, 1, 'waiting must not redispatch'); assert.equal(waits, 2);
+      if (terminalTimeout) {
+        assert.equal(workflow.status().unresolvedJobs.length, 1, 'a confirmed host timeout ends observation');
+        assert.throws(() => workflow.context(jobId, sessionKey), /not active/);
+      } else {
+        assert.equal(workflow.status().jobs.completed, 1, 'pending is not a failed or unresolved run');
+        assert.equal(workflow.status().messages.done, 1);
+      }
+      assert.equal(runs, 1, 'waiting must not redispatch'); assert.equal(waits, 4);
     } finally { await workflow.stop(); }
   }));
 });
@@ -638,6 +651,7 @@ test('uncertain normal and alternate-target sends cannot be skipped or replayed'
       assert.ok(snapshot.transcript);
       assert.match(readFileSync(snapshot.transcript, 'utf8'), /Please answer/);
       assert.equal(snapshot.replies[0].status, 'uncertain');
+      assert.throws(() => workflow.resolve(jobId, 'Investigating a possible delivery', 'retry'), /uncertain/);
       assert.equal(snapshot.messages[0].message.id, 'aa01');
       assert.equal(workflow.inspect('aa01')[0].message.status, 'needs_review');
       assert.throws(() => workflow.context(jobId, snapshot.job.session_key), /not active/);
@@ -649,6 +663,122 @@ test('uncertain normal and alternate-target sends cannot be skipped or replayed'
     } finally { await workflow.stop(); }
   }));
 });
+
+test('triage replies honor the live toggle, send per conversation and defer only unfinished mail across restart', async t => withHarness(async h => {
+  t.mock.timers.enable({ apis: ['Date'], now: Date.now() });
+  const messages = [1, 2, 3].map(i => ({ ...message(`aa0${i}`, 'Reply back when you get this.', { received: Date.now() - 60000 }), threadId: `bb0${i}` }));
+  const mailbox = separateThreads(messages);
+  mailbox.threads.bb01.thread.messages.unshift(message('aa00', 'Scheduling guest', {
+    sender: 'guest@outside.test', received: Date.now() - 120000,
+  }));
+  h.setFixture(mailbox);
+  const provider = assessments(() => ({ action: { type: 'choice', choice: 'wake', probabilities: {} } }));
+  const config = triageConfig({ ...h.config, settings: { replyAllowed: false } });
+  let workflow: ReturnType<typeof createMailWorkflow>, runs = 0, checks = 0;
+  const mail = new GogMailClient(config), getThread = mail.getThread.bind(mail);
+  let disableDuringRead = false;
+  mail.getThread = async id => {
+    const thread = await getThread(id);
+    if (disableDuringRead) {
+      disableDuringRead = false;
+      workflow.policyUpdate(undefined, workflow.policyGet().version, 'helper', { replyAllowed: false });
+    }
+    return thread;
+  };
+  const subagent: MailSubagent = {
+    run: async ({ sessionKey, message: prompt, toolsAlsoAllow }) => {
+      runs++;
+      const jobId = jobIdFromPrompt(prompt);
+      const reply = { jobId, sessionKey, body: 'Received, thank you.' };
+      assert.ok(toolsAlsoAllow?.includes('gog_email_reply'), 'triage exposes its reply tool');
+      if (runs === 1) {
+        assert.equal(workflow.context(jobId, sessionKey).replyAllowed, false);
+        await assert.rejects(workflow.reply({ ...reply, threadId: 'bb01' }), /disabled/);
+        workflow.policyUpdate(undefined, workflow.policyGet().version, 'helper', { replyAllowed: true });
+        const context = workflow.context(jobId, sessionKey);
+        assert.equal(context.replyAllowed, true);
+        assert.ok(context.messages.every(row => row.replyAllowed));
+        await assert.rejects(workflow.reply(reply), /threadId/);
+        await assert.rejects(workflow.reply({ ...reply, threadId: 'bb99' }), /not.*job/);
+        disableDuringRead = true;
+        await assert.rejects(workflow.reply({ ...reply, threadId: 'bb02' }), /disabled/);
+        workflow.policyUpdate(undefined, workflow.policyGet().version, 'helper', { replyAllowed: true });
+        const sends = await Promise.allSettled([
+          workflow.reply({ ...reply, threadId: 'bb01', externalScheduling: true, replyTargetMessageId: 'aa00' }),
+          workflow.reply({ ...reply, threadId: 'bb01', externalScheduling: true, replyTargetMessageId: 'aa00' }),
+          workflow.reply({ ...reply, threadId: 'bb02' }),
+        ]);
+        assert.equal(sends.slice(0, 2).filter(result => result.status === 'fulfilled').length, 1, 'same-target races send once');
+        const duplicate = sends.slice(0, 2).find(result => result.status === 'rejected');
+        assert.ok(duplicate?.status === 'rejected');
+        assert.match(String(duplicate.reason), /duplicate/);
+        assert.equal(sends[2].status, 'fulfilled', 'independent conversations can send concurrently');
+        await assert.rejects(workflow.reply({ ...reply, threadId: 'bb01' }), /duplicate/);
+        assert.equal(workflow.context(jobId, sessionKey).messages.find(row => row.threadId === 'bb01')?.replyStatus, 'sent');
+        workflow.complete({ jobId, sessionKey, reason: 'Two replies sent; third needs follow-up' }, Math.floor(Date.now() / 1000) + 60);
+      } else {
+        assert.deepEqual(workflow.context(jobId, sessionKey).messages.flatMap(row => row.messageIds), ['aa03']);
+        await workflow.reply(reply); // One conversation needs no selector.
+        workflow.complete({ jobId, sessionKey, reason: 'All conversations handled' });
+      }
+      checks++;
+      return { runId: jobId };
+    }, waitForRun: async () => ({ status: 'ok' }),
+  };
+  workflow = createMailWorkflow({ config, stateDir: h.stateDir, mail, ...provider, subagent });
+  try {
+    await workflow.start(); await waitFor(() => !workflow.status().working);
+    assert.equal(checks, 1, JSON.stringify(workflow.status().unresolvedJobs));
+    assert.deepEqual(workflow.status().messages, { deferred: 1, done: 2 });
+    assert.equal(provider.calls(), 3, 'reply toggle does not reclassify mail');
+    await workflow.stop();
+    t.mock.timers.setTime(Date.now() + 60000);
+    workflow = createMailWorkflow({ config, stateDir: h.stateDir, ...provider, subagent });
+    await workflow.start(); await waitFor(() => !workflow.status().working);
+    assert.equal(checks, 2);
+    assert.deepEqual(workflow.status().messages, { done: 3 });
+    assert.equal(workflow.policyGet().settings.replyAllowed, true, 'live override survives restart');
+    const sends = h.calls().filter(args => args.includes('send'));
+    assert.deepEqual(sends.map(args => args[args.indexOf('--reply-to-message-id') + 1]).sort(), ['aa00', 'aa02', 'aa03']);
+    const scheduling = sends.find(args => args[args.indexOf('--reply-to-message-id') + 1] === 'aa00')!;
+    assert.equal(scheduling[scheduling.indexOf('--to') + 1], 'guest@outside.test');
+  } finally { await workflow.stop(); }
+}));
+
+test('uncertain triage replies block replay and completion without blocking other conversations', async () => withHarness(async h => {
+  const messages = [1, 2, 3].map(i => ({ ...message(`aa0${i}`, 'Please acknowledge', {
+    received: Date.now() - 60000, sender: i === 3 ? 'outside@elsewhere.test' : approved,
+  }), threadId: `bb0${i}` }));
+  const mailbox = separateThreads(messages);
+  h.setFixture({ ...mailbox, send: {} });
+  const provider = assessments(() => ({ action: { type: 'choice', choice: 'wake', probabilities: {} } }));
+  let workflow: ReturnType<typeof createMailWorkflow>, checked = false;
+  workflow = createMailWorkflow({ config: triageConfig(h.config), stateDir: h.stateDir, ...provider, subagent: {
+    run: async ({ sessionKey, message: prompt }) => {
+      const jobId = jobIdFromPrompt(prompt), reply = { jobId, sessionKey, body: 'Received' };
+      assert.equal(workflow.context(jobId, sessionKey).messages.find(row => row.threadId === 'bb03')?.replyAllowed, false);
+      await assert.rejects(workflow.reply({ ...reply, threadId: 'bb03' }), /external-or-invalid-sender/);
+      await assert.rejects(workflow.reply({ ...reply, threadId: 'bb01' }), /acknowledgment/);
+      await assert.rejects(workflow.reply({ ...reply, threadId: 'bb01' }), /duplicate/);
+      h.setFixture(mailbox);
+      await workflow.reply({ ...reply, threadId: 'bb02' });
+      assert.throws(() => workflow.complete({ jobId, sessionKey, reason: 'All sent' }), /uncertain/);
+      assert.throws(() => workflow.complete({ jobId, sessionKey, reason: 'Retry later' }, Math.floor(Date.now() / 1000) + 60), /uncertain/);
+      assert.throws(() => workflow.skip({ jobId, sessionKey, reason: 'Skip' }), /uncertain/);
+      checked = true; return { runId: jobId };
+    }, waitForRun: async () => ({ status: 'ok' }),
+  } });
+  try {
+    await workflow.start(); await waitFor(() => !workflow.status().working);
+    assert.ok(checked, JSON.stringify(workflow.status().unresolvedJobs));
+    assert.equal(workflow.status().jobs.failed, 1);
+    assert.equal(workflow.inspect('aa01')[0].message.status, 'failed');
+    assert.equal(workflow.inspect('aa02')[0].message.status, 'done');
+    assert.equal(h.calls().filter(args => args.includes('send')).length, 2);
+    const snapshot = workflow.inspectJob(String(workflow.status().unresolvedJobs[0].id));
+    assert.deepEqual(snapshot.replies.map(row => row.status).sort(), ['sent', 'uncertain']);
+  } finally { await workflow.stop(); }
+}));
 
 test('mail queued during a thread fetch is handled by the next job, not ignored', async () => withHarness(async (h) => {
   h.setFixture(fixture([]));
@@ -690,6 +820,177 @@ test('mail queued during a thread fetch is handled by the next job, not ignored'
     await workflow.stop();
   }
 }));
+
+test('agent concurrency is live-configurable while same-thread runs and whole-cycle wakes stay ordered', async t => {
+  for (const triage of [false, true]) await t.test(triage ? 'triage' : 'responder', async () => withHarness(async h => {
+    h.setFixture(fixture([]));
+    let release!: () => void;
+    const firstRun = new Promise<void>(resolve => { release = resolve; });
+    let workflow: ReturnType<typeof createMailWorkflow>;
+    const runs: Array<{ jobId: string; sessionKey: string; ids: string[] }> = [];
+    const provider = assessments(() => ({ action: { type: 'choice', choice: 'wake', probabilities: {} } }));
+    workflow = createMailWorkflow({ config: triage ? triageConfig(h.config) : h.config, stateDir: h.stateDir, ...provider, subagent: {
+      run: async ({ sessionKey, message: prompt }) => {
+        const jobId = jobIdFromPrompt(prompt);
+        runs.push({ jobId, sessionKey, ids: workflow.context(jobId, sessionKey).messages.flatMap(row => row.messageIds) });
+        return { runId: jobId };
+      },
+      waitForRun: async ({ runId }) => {
+        const run = runs.find(run => run.jobId === runId)!;
+        if (run === runs[0]) await firstRun;
+        workflow.complete({ jobId: run.jobId, sessionKey: run.sessionKey, reason: 'Handled this conversation' });
+        return { status: 'ok' };
+      },
+    } });
+    try {
+      await workflow.start();
+      const first = message('aa01', 'Long task'), other = { ...message('aa02', 'Independent urgent task'), threadId: 'bb02' };
+      const mailbox = separateThreads([first]);
+      h.setFixture(mailbox); await workflow.poll(); await waitFor(() => runs.length === 1);
+      Object.assign(mailbox.threads, separateThreads([other]).threads);
+      mailbox.search.messages.push({ id: other.id, threadId: other.threadId });
+      h.setFixture(mailbox); await workflow.poll();
+      assert.equal(runs.length, 1, 'default capacity preserves current deployment behavior');
+      workflow.policyUpdate(undefined, workflow.policyGet().version, 'helper', { agentConcurrency: 2 });
+      await waitFor(() => runs.length === 2);
+      assert.deepEqual(runs[1].ids, ['aa02'], 'independent mail runs before the held run finishes');
+      const followup = message('aa03', 'Follow-up in the busy conversation');
+      mailbox.threads.bb01.thread.messages.push(followup);
+      mailbox.search.messages.push({ id: followup.id, threadId: followup.threadId });
+      h.setFixture(mailbox); await workflow.poll();
+      assert.equal(runs.length, 2, 'one thread cannot have overlapping agent jobs');
+      release(); await waitFor(() => !workflow.status().working && runs.length === 3);
+      assert.deepEqual(runs[2].ids, ['aa03']);
+      assert.equal(workflow.status().messages.done, 3);
+    } finally { release(); await workflow.stop(); }
+  }));
+});
+
+test('historical inference does not pause new-mail discovery and wakes', async () => withHarness(async h => {
+  h.setFixture(fixture([]));
+  let release!: () => void, entered = false, woke = false;
+  const historical = new Promise<void>(resolve => { release = resolve; });
+  const provider = assessments(() => ({ action: { type: 'choice', choice: 'wake', probabilities: {} } }));
+  const decisions: DecisionRuntimeV1 = { evaluate: async (batch, opts) => {
+    if (!opts.purpose.endsWith('delete-scan')) return provider.decisions.evaluate(batch, opts);
+    entered = true; await historical;
+    return { status: 'ok', provenance: { providerId: 'typesafe', rubricVersion: 'mail-v3', runtimeGeneration: 'test' },
+      result: { model: 'jev-1.13.0', answers: { action: { type: 'choice', choice: 'delete', probabilities: {} } } } };
+  } };
+  let workflow: ReturnType<typeof createMailWorkflow>;
+  workflow = createMailWorkflow({ config: triageConfig(h.config, { policy: { ...defaultPolicy, deletePrompt: 'Delete old promotions' } }),
+    stateDir: h.stateDir, ...provider, decisions, subagent: {
+      run: async ({ sessionKey, message: prompt }) => {
+        const jobId = jobIdFromPrompt(prompt);
+        assert.deepEqual(workflow.context(jobId, sessionKey).messages.flatMap(row => row.messageIds), ['aa02']);
+        workflow.complete({ jobId, sessionKey, reason: 'Handled new mail during cleanup' }); woke = true;
+        return { runId: jobId };
+      }, waitForRun: async () => ({ status: 'ok' }),
+    } });
+  let scan: ReturnType<typeof workflow.scan> | undefined;
+  try {
+    await workflow.start();
+    const old = message('aa01', 'Old promotion', { received: Date.parse('2025-04-01') });
+    h.setFixture(separateThreads([old]));
+    scan = workflow.scan({ from: '2025-01-01', to: '2026-01-01' }); await waitFor(() => entered);
+    const recent = { ...message('aa02', 'Please respond now'), threadId: 'bb02' };
+    h.setFixture(separateThreads([old, recent]));
+    await workflow.poll();
+    assert.ok(workflow.inspect(recent.id).length, 'routine discovery must proceed while historical inference is pending');
+    await waitFor(() => woke);
+    assert.equal(workflow.status().scan?.status, 'processing');
+    release(); assert.equal((await scan).deleted, 1);
+    assert.equal(workflow.inspect(recent.id)[0].message.status, 'done');
+  } finally { release(); await scan?.catch(() => {}); await workflow.stop(); }
+}));
+
+test('historical deletion cannot remove later pages from concurrent inbox discovery', async () => withHarness(async h => {
+  h.setFixture(fixture([]));
+  let releasePage!: () => void, pageWaiting = false, pageRead = false, scanDecisions = 0;
+  const pageGate = new Promise<void>(resolve => { releasePage = resolve; });
+  const mail = new GogMailClient(h.config), searchPage = mail.searchPage.bind(mail), modify = mail.modify.bind(mail);
+  mail.searchPage = async (after, page, scope, before) => {
+    if (scope === 'inbox' && page) { pageWaiting = true; await pageGate; }
+    const result = await searchPage(after, page, scope, before);
+    if (scope === 'inbox' && page) pageRead = true;
+    return result;
+  };
+  mail.modify = async (...args) => {
+    assert.ok(pageRead, 'plugin mutations must wait until every inbox page is read');
+    return modify(...args);
+  };
+  const provider = assessments();
+  const decisions: DecisionRuntimeV1 = { evaluate: async (batch, opts) => {
+    if (!opts.purpose.endsWith('delete-scan')) return provider.decisions.evaluate(batch, opts);
+    scanDecisions++;
+    const threadId = (batch.state as { threadId: string }).threadId;
+    return { status: 'ok', provenance: { providerId: 'typesafe', rubricVersion: 'mail-v3', runtimeGeneration: 'test' },
+      result: { model: 'jev-1.13.0', answers: { action: { type: 'choice', choice: threadId === 'bb02' ? 'delete' : 'keep', probabilities: {} } } } };
+  } };
+  const workflow = createMailWorkflow({ config: triageConfig(h.config, { policy: { ...defaultPolicy, deletePrompt: 'Delete promotions' } }),
+    stateDir: h.stateDir, mail, ...provider, decisions,
+    subagent: { run: async () => { throw new Error('queue is not due'); }, waitForRun: async () => ({ status: 'ok' }) } });
+  let poll: Promise<void> | undefined, scan: ReturnType<typeof workflow.scan> | undefined;
+  try {
+    await workflow.start();
+    const received = Date.now() - 60000;
+    const mailbox = separateThreads([message('aa01', 'Keep', { received }), { ...message('aa02', 'Promotion', { received }), threadId: 'bb02' }]);
+    mailbox.pages = { p2: { messages: mailbox.search.messages.slice(1) } };
+    mailbox.search = { messages: mailbox.search.messages.slice(0, 1), nextPageToken: 'p2' };
+    h.setFixture(mailbox);
+    poll = workflow.poll(); await waitFor(() => pageWaiting);
+    scan = workflow.scan({ from: new Date(received - 1000).toISOString(), to: new Date(received + 1000).toISOString() });
+    await waitFor(() => scanDecisions === 2);
+    // Give the independent scan time to attempt its write while page two is held.
+    await new Promise(resolve => setTimeout(resolve, 100));
+    assert.equal(h.calls().filter(args => args.includes('modify')).length, 0);
+    releasePage(); await poll;
+    const report = await scan;
+    assert.equal(report.deleted, 1); assert.equal(report.failed, 0);
+    assert.equal(workflow.inspect().length, 2, 'deletion must not hide the later-page candidate');
+    assert.equal(workflow.inspect('aa01')[0].message.status, 'queue');
+    assert.equal(workflow.inspect('aa02')[0].message.status, 'done', 'a stale poll must not resurrect deleted work');
+  } finally { releasePage(); await Promise.allSettled([poll, scan]); await workflow.stop(); }
+}));
+
+test('explicit recovery retries unfinished work without replaying completed replies', async t => {
+  for (const triage of [false, true]) await t.test(triage ? 'partial triage reply' : 'unacted responder', async () => withHarness(async h => {
+    h.setFixture(fixture([]));
+    const provider = assessments(() => ({ action: { type: 'choice', choice: 'wake', probabilities: {} } }));
+    let workflow: ReturnType<typeof createMailWorkflow>, runs = 0;
+    const jobs: string[] = [];
+    workflow = createMailWorkflow({ config: triage ? triageConfig(h.config) : h.config, stateDir: h.stateDir, ...provider, subagent: {
+      run: async ({ sessionKey, message: prompt }) => {
+        runs++;
+        const jobId = jobIdFromPrompt(prompt); jobs.push(jobId);
+        if (runs === 1) {
+          if (triage) await workflow.reply({ jobId, sessionKey, threadId: 'bb01', body: 'First answered' });
+          throw new Error('Known failure before remaining work');
+        }
+        const ids = workflow.context(jobId, sessionKey).messages.flatMap(row => row.messageIds);
+        assert.deepEqual(ids, triage ? ['aa02'] : ['aa01']);
+        await workflow.reply({ jobId, sessionKey, body: 'Recovered work answered' });
+        if (triage) workflow.complete({ jobId, sessionKey, reason: 'Recovered remainder complete' });
+        return { runId: jobId };
+      }, waitForRun: async () => ({ status: 'ok' }),
+    } });
+    try {
+      await workflow.start();
+      const messages = [message('aa01', 'First request')];
+      if (triage) messages.push({ ...message('aa02', 'Second request'), threadId: 'bb02' });
+      h.setFixture(separateThreads(messages));
+      await workflow.poll(); await waitFor(() => !workflow.status().working);
+      assert.equal(workflow.status().unresolvedJobs.length, 1);
+      workflow.resolve(jobs[0], 'Confirmed the host run ended; remaining work has not been performed', 'retry');
+      await workflow.poll(); await waitFor(() => !workflow.status().working);
+      assert.equal(runs, 2, 'retry actually resumes rather than marking work done');
+      assert.notEqual(jobs[0], jobs[1], 'recovery dispatch has a new idempotency identity');
+      assert.equal(workflow.status().messages.done, messages.length);
+      assert.equal(h.calls().filter(args => args.includes('send')).length, messages.length);
+      assert.equal(workflow.status().unresolvedJobs.length, 0);
+    } finally { await workflow.stop(); }
+  }));
+});
 
 test('re-added rules exclude disabled-period mail while continuously matching rules still authorize it', async t => withHarness(async h => {
   t.mock.timers.enable({ apis: ['Date'], now: Date.now() });
@@ -758,6 +1059,9 @@ test('new mail uses full chronological thread and a stable session, then sends o
       const positions = ['Original request', 'Prior agent reply', 'External context', 'Please follow up.'].map(text => transcript.indexOf(text));
       assert.ok(positions.every((position, i) => position >= 0 && (i === 0 || position > positions[i - 1])), 'every message is present in chronological order');
       const reply = { jobId: jobIdFromPrompt(params.message), sessionKey: params.sessionKey, body: 'Intro <unsafe>\n\n- First\n- Second & final' };
+      workflow.policyUpdate(undefined, workflow.policyGet().version, 'helper', { replyAllowed: false });
+      await assert.rejects(workflow.reply(reply), /disabled/);
+      workflow.policyUpdate(undefined, workflow.policyGet().version, 'helper', { replyAllowed: true });
       await assert.rejects(workflow.reply({ ...reply, externalTo: ['a@external.test,b@external.test'] }), /invalid explicit external recipient/);
       await workflow.reply({ ...reply, externalTo: ['Customer <CUSTOMER@external.test>', 'customer@external.test'] });
       return { runId: 'run-1', sessionKey: params.sessionKey };
@@ -1146,32 +1450,71 @@ test('label retries use recreated Gmail labels without another classification', 
   } finally { await workflow.stop(); }
 }));
 
-test('categorization cannot change mailbox folders but can apply non-folder system flags', async () => withHarness(async h => {
+test('a rejected category does not block valid labels, and retry reuses inference', async () => withHarness(async h => {
   const target = message('aa01', 'Keep this queued', { received: Date.now() - 60000 });
   h.setFixture({ ...fixture([target]), labels: [
     { id: 'TRASH', name: 'TRASH', type: 'system' }, { id: 'STARRED', name: 'STARRED', type: 'system' },
   ] });
   const provider = assessments();
+  let labelCalls = 0;
   const decisions: DecisionRuntimeV1 = { evaluate: async (batch, opts) => {
     if (!opts.purpose.endsWith('.labels')) return provider.decisions.evaluate(batch, opts);
+    labelCalls++;
     return { status: 'ok', provenance: { providerId: 'typesafe', rubricVersion: 'mail-v3', runtimeGeneration: 'test' },
-      result: { model: 'jev-1.13.0', answers: { label_0: { type: 'choice', choice: 'apply', probabilities: {} } } } };
+      result: { model: 'jev-1.13.0', answers: Object.fromEntries(Object.keys(batch.questions).map(id =>
+        [id, { type: 'choice', choice: 'apply', probabilities: {} }])) } };
   } };
-  const policy = { ...defaultPolicy, labels: [{ name: 'TRASH', description: 'Expired promotions' }] };
-  const workflow = createMailWorkflow({ config: triageConfig(h.config, { policy }), stateDir: h.stateDir, ...provider, decisions,
+  const policy = { ...defaultPolicy, labels: [{ name: 'TRASH', description: 'Expired promotions' }, { name: 'STARRED', description: 'Worth keeping handy' }] };
+  const workflow = createMailWorkflow({ config: triageConfig({ ...h.config, settings: { retryDelaySeconds: 0 } }, { policy }), stateDir: h.stateDir, ...provider, decisions,
     subagent: { run: async () => { throw new Error('queue is not due'); }, waitForRun: async () => ({ status: 'ok' }) } });
   try {
     await workflow.start(); await waitFor(() => !workflow.status().triage!.labeling);
     const mail = new GogMailClient(h.config);
-    assert.deepEqual((await mail.getThread('bb01')).messages[0].labelIds, ['INBOX']);
+    assert.deepEqual((await mail.getThread('bb01')).messages[0].labelIds, ['INBOX', 'STARRED']);
     assert.equal(workflow.status().messages.queue, 1);
     assert.match(String(workflow.inspect('aa01')[0].labels?.reason), /mailbox-state label/);
-    assert.ok(!h.calls().some(args => args.includes('modify')));
+    await workflow.poll(); await waitFor(() => !workflow.status().triage!.labeling);
+    assert.equal(labelCalls, 1, 'an unrelated category error must not cost another assessment');
+    assert.equal(h.calls().filter(args => args.includes('modify')).length, 1, 'already applied healthy labels are reconciled');
     workflow.policyUpdate({ ...policy, labels: [{ name: 'STARRED', description: 'Worth keeping handy' }] }, 1, 'main');
     await workflow.poll(); await waitFor(() => !workflow.status().triage!.labeling);
     assert.deepEqual((await mail.getThread('bb01')).messages[0].labelIds, ['INBOX', 'STARRED']);
     assert.equal(workflow.inspect('aa01')[0].labels?.status, 'done');
     assert.equal(provider.calls(), 1);
+  } finally { await workflow.stop(); }
+}));
+
+test('deep MIME conversations reach triage and the agent with plaintext and filenames intact', async () => withHarness(async h => {
+  const target = message('aa01', 'DEEPEST_PLAINTEXT', { received: Date.now() - 60000 });
+  let body: GmailMessage['payload'] = { mimeType: 'multipart/alternative', parts: [
+    { mimeType: 'text/html', body: { data: Buffer.from('<p>HTML_DUPLICATE</p>').toString('base64url') } },
+    { ...target.payload, headers: undefined },
+  ] };
+  for (let depth = 0; depth < 128; depth++) body = { mimeType: 'multipart/mixed', parts: [body] };
+  target.payload = { mimeType: 'multipart/mixed', headers: target.payload.headers, parts: [
+    body, { mimeType: 'application/pdf', filename: 'deep-contract.pdf', body: { attachmentId: 'not-downloaded' } },
+  ] };
+  h.setFixture(fixture([target]));
+  const provider = assessments(() => ({ action: { type: 'choice', choice: 'wake', probabilities: {} } }));
+  let classified = false, handled = false, workflow: ReturnType<typeof createMailWorkflow>;
+  const decisions: DecisionRuntimeV1 = { evaluate: async (batch, opts) => {
+    const text = JSON.stringify(batch.state);
+    assert.match(text, /DEEPEST_PLAINTEXT/); assert.match(text, /deep-contract.pdf/);
+    assert.doesNotMatch(text, /HTML_DUPLICATE/);
+    classified = true; return provider.decisions.evaluate(batch, opts);
+  } };
+  workflow = createMailWorkflow({ config: triageConfig(h.config), stateDir: h.stateDir, ...provider, decisions, subagent: {
+    run: async ({ sessionKey, message: prompt }) => {
+      const jobId = jobIdFromPrompt(prompt), context = workflow.context(jobId, sessionKey);
+      assert.match(readFileSync(context.messages[0].transcript!, 'utf8'), /DEEPEST_PLAINTEXT/);
+      workflow.complete({ jobId, sessionKey, reason: 'Read nested mail' }); handled = true;
+      return { runId: jobId };
+    }, waitForRun: async () => ({ status: 'ok' }),
+  } });
+  try {
+    await workflow.start(); await waitFor(() => !workflow.status().working);
+    assert.ok(classified && handled, JSON.stringify(workflow.inspect('aa01')));
+    assert.equal(workflow.status().messages.done, 1);
   } finally { await workflow.stop(); }
 }));
 
@@ -1542,7 +1885,9 @@ test('rolling triage skips old messages before inference, handles new replies on
       const jobId = jobIdFromPrompt(prompt);
       const context = workflow.context(jobId, sessionKey);
       wakes.push(context.messages.flatMap(row => row.messageIds));
-      assert.equal(context.replyAllowed, false, 'triage does not grant send authorization');
+      assert.equal(context.replyAllowed, true, 'reply setting applies to triage as well as responders');
+      assert.ok(context.messages.filter(row => row.sender === 'outside@elsewhere.test').every(row => !row.replyAllowed),
+        'classification does not expand the configured sender rules');
       workflow.complete({ jobId, sessionKey, reason: 'Handled without sending' });
       return { runId: jobId, sessionKey };
     }, waitForRun: async () => ({ status: 'ok' }),
@@ -1654,20 +1999,29 @@ test('upgrading defaults preserves saved agent policy until an explicit file edi
     labels: [{ name: 'Customers', description: 'Customer conversations' }] };
   try {
     await workflow.start();
-    workflow.policyUpdate(custom, workflow.policyGet().version, 'agent');
+    const saved = workflow.policyUpdate(custom, workflow.policyGet().version, 'agent', { concurrency: 9, retryDelaySeconds: 77 });
     await workflow.stop();
     const db = h.db();
     // A prior release fingerprint differs from the new built-in default.
     db.prepare("UPDATE meta SET value='previous-release-default' WHERE key='triage_config_policy'").run();
     db.prepare("UPDATE meta SET value='thread' WHERE key='triage_unit'").run();
+    // v0.3.6's unchanged file fingerprint must not reset saved live settings
+    // merely because a new built-in replyAllowed default was added.
+    db.prepare("UPDATE meta SET value='f318ecbf3aa1e27aa4e8d6c25e169bf205e824ec3c61fe227977acc2f32f0c77' WHERE key='runtime_config_settings'").run();
+    const { replyAllowed: _reply, ...priorSettings } = saved.configuredSettings;
+    db.prepare("UPDATE policies SET settings=? WHERE version=?").run(JSON.stringify(priorSettings), saved.version);
     db.close();
     workflow = createMailWorkflow({ config, stateDir: h.stateDir, ...provider, subagent });
     await workflow.start();
     assert.deepEqual(workflow.policyGet().document, custom);
+    assert.equal(workflow.policyGet().settings.replyAllowed, true);
+    assert.equal(workflow.policyGet().settings.concurrency, 9);
+    assert.equal(workflow.policyGet().settings.retryDelaySeconds, 77);
     await workflow.stop();
     workflow = createMailWorkflow({ config, stateDir: h.stateDir, ...provider, subagent });
     await workflow.start();
     assert.deepEqual(workflow.policyGet().document, custom, 'an unchanged restart retains customizations');
+    assert.equal(workflow.policyGet().settings.concurrency, 9);
     await workflow.stop();
     workflow = createMailWorkflow({ config: triageConfig(h.config, { policy: defaultPolicy }), stateDir: h.stateDir, ...provider, subagent });
     await workflow.start();

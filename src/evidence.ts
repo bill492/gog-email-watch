@@ -1,4 +1,4 @@
-import { attachmentNames, bodyText, sentDate, type GmailPart, type GmailThread } from "./mail.js";
+import { attachmentNames, bodyText, mimeParts, sentDate, type GmailThread } from "./mail.js";
 import { hash } from "./policy.js";
 import type { RuntimeSettings } from "./policy.js";
 import type { DecisionBatch, JsonValue } from "openclaw/plugin-sdk/decisions";
@@ -10,18 +10,20 @@ const tokens = (value: unknown) => (tokenizer ??= get_encoding("cl100k_base")).e
 
 export function evidence(thread: GmailThread) {
   const missing = new Set<string>();
-  function scan(part: GmailPart) {
-    if (part.filename || part.body?.attachmentId) missing.add("unscanned attachment");
-    if (!part.parts?.length && !part.filename && !part.body?.attachmentId && part.mimeType !== "text/plain" && part.mimeType !== "text/html") missing.add("unsupported MIME part");
-    for (const child of part.parts ?? []) scan(child);
-  }
   const messages = thread.messages.filter(message => !message.labelIds.includes("DRAFT"))
     .sort((a, b) => Number(a.internalDate) - Number(b.internalDate) || a.id.localeCompare(b.id));
   // Mailbox metadata is a snapshot, not new conversation content. Reading mail or
   // applying our own labels must not invalidate the assessment and repeat a wake.
-  const fingerprint = hash({ format: 4, threadId: thread.id, messages: messages.map(({ id, internalDate, payload }) => ({ id, internalDate, payload })) });
+  // Flatten MIME structure for hashing as well: JSON.stringify on a deeply
+  // nested payload would otherwise reintroduce a call-stack depth limit.
+  const fingerprint = hash({ format: 5, threadId: thread.id, messages: messages.map(({ id, internalDate, payload }) => ({
+    id, internalDate, payload: [...mimeParts(payload)].map(({ parts, ...fields }) => ({ ...fields, children: parts?.length ?? 0 })),
+  })) });
   const sections = messages.map(message => {
-    scan(message.payload);
+    for (const part of mimeParts(message.payload)) {
+      if (part.filename || part.body?.attachmentId) missing.add("unscanned attachment");
+      if (!part.parts?.length && !part.filename && !part.body?.attachmentId && part.mimeType !== "text/plain" && part.mimeType !== "text/html") missing.add("unsupported MIME part");
+    }
     const body = bodyText(message.payload).trim();
     if (!body) missing.add("missing inline body");
     const headers = (message.payload.headers ?? []).filter(header => ["from", "to", "cc", "bcc", "reply-to", "subject"].includes(header.name.toLowerCase()));

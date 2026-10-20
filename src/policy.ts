@@ -6,15 +6,17 @@ import type { MailState } from "./state.js";
 
 const object = { additionalProperties: false } as const;
 export const SettingsSchema = Type.Partial(Type.Object({
+  replyAllowed: Type.Boolean({ default: true, description: "Allow in-thread replies in responder and triage jobs. Existing approved-sender and recipient checks still apply. Live-editable; false disables sends." }),
   wakePrompt: Type.String({ default: "", description: "Additional instructions for the awakened triage agent, not Jev." }),
   responderPrompt: Type.String({ default: "", description: "Additional instructions for new-mail responder jobs." }),
   pollIntervalSeconds: Type.Integer({ minimum: 1, default: 120 }),
   concurrency: Type.Integer({ minimum: 1, default: 50 }),
+  agentConcurrency: Type.Integer({ minimum: 1, default: 1, description: "Concurrent independent agent jobs. Each triage cycle remains one wake; jobs sharing a Gmail thread stay ordered." }),
   labelConcurrency: Type.Union([Type.Integer({ minimum: 1 }), Type.Null()], { default: null, description: "Independent label workers; null inherits concurrency." }),
   retryDelaySeconds: Type.Union([Type.Number({ minimum: 0 }), Type.Null()], { default: null, description: "Delay before retry eligibility; null inherits polling interval. Retries run on polls." }),
   decisionTimeoutSeconds: Type.Number({ exclusiveMinimum: 0, default: 30 }),
   gogTimeoutSeconds: Type.Number({ exclusiveMinimum: 0, default: 90 }),
-  agentWaitTimeoutSeconds: Type.Number({ exclusiveMinimum: 0, default: 660 }),
+  agentWaitTimeoutSeconds: Type.Number({ exclusiveMinimum: 0, default: 660, description: "Maximum observation-call duration, sliced for shutdown responsiveness. Nonterminal timeouts renew observation; never a job runtime limit." }),
   gogMaxOutputBytes: Type.Integer({ minimum: 1, default: 10 * 1024 * 1024 }),
   discoveryOverlapSeconds: Type.Number({ minimum: 0, default: 600 }),
   reconcileIntervalSeconds: Type.Number({ exclusiveMinimum: 0, default: 3600 }),
@@ -30,6 +32,8 @@ export const SettingsSchema = Type.Partial(Type.Object({
 export type SettingsPatch = Static<typeof SettingsSchema>;
 type StoredSettings = Required<Omit<SettingsPatch, "evidence">>;
 export const defaultSettings: StoredSettings = {
+  replyAllowed: true,
+  agentConcurrency: 1,
   wakePrompt: "", responderPrompt: "", pollIntervalSeconds: 120, concurrency: 50, labelConcurrency: null,
   retryDelaySeconds: null, decisionTimeoutSeconds: 30, gogTimeoutSeconds: 90, agentWaitTimeoutSeconds: 660,
   gogMaxOutputBytes: 10 * 1024 * 1024, discoveryOverlapSeconds: 600, reconcileIntervalSeconds: 3600,
@@ -93,7 +97,10 @@ export function createPolicyStore(config: MailConfig, state: MailState) {
   const configuredSettings = mergeSettings({ ...defaultSettings, pollIntervalSeconds: config.pollIntervalSeconds,
     concurrency: config.triage?.concurrency ?? 1 }, config.settings ?? {});
   // Fingerprint the file choice, not a built-in default that can change on upgrade.
-  const policyHash = hash(config.triage?.policy ?? null), settingsHash = hash(configuredSettings);
+  const policyHash = hash(config.triage?.policy ?? null);
+  const { evidence: _ignored, ...fileSettings } = config.settings ?? {};
+  const settingsHash = hash({ pollIntervalSeconds: config.pollIntervalSeconds, concurrency: config.triage?.concurrency ?? 1,
+    settings: Object.fromEntries(Object.entries(fileSettings).sort(([a], [b]) => a.localeCompare(b))) });
   const now = () => Math.floor(Date.now() / 1000);
   type Snapshot = { version: number; document: Policy; settings: StoredSettings };
   function read(version?: number): Snapshot {
@@ -133,12 +140,15 @@ export function createPolicyStore(config: MailConfig, state: MailState) {
   const policyChanged = config.triage && state.meta("triage_config_policy") !== policyHash;
   const threadMigration = config.triage && state.meta("triage_unit") !== "rolling-thread";
   // Recognize the old file fingerprint without resetting persisted live overrides.
-  const { maxAgeDays: _age, maxInputTokens: _input, maxRequestTokens: _request, ...previousSettings } = configuredSettings;
+  const { replyAllowed: _reply, agentConcurrency: _agents, ...v036Settings } = configuredSettings;
+  const { maxAgeDays: _age, maxInputTokens: _input, maxRequestTokens: _request, ...previousSettings } = v036Settings;
   const legacySettingsHash = hash({ ...previousSettings, evidence: { maxBytes: 16_000, context: "thread", ...config.settings?.evidence } });
   const newOverrides = ["maxAgeDays", "maxInputTokens", "maxRequestTokens"].some(key => key in (config.settings ?? {}));
-  const settingsChanged = state.meta("runtime_config_settings") !== settingsHash &&
-    (newOverrides || (state.meta("runtime_config_settings") !== hash(previousSettings) &&
-    state.meta("runtime_config_settings") !== legacySettingsHash));
+  const oldFingerprint = state.meta("runtime_config_settings");
+  const unchangedLegacySettings = !["replyAllowed", "agentConcurrency"].some(key => key in (config.settings ?? {})) &&
+    (oldFingerprint === hash(v036Settings) || (!newOverrides &&
+      (oldFingerprint === hash(previousSettings) || oldFingerprint === legacySettingsHash)));
+  const settingsChanged = oldFingerprint !== settingsHash && !unchangedLegacySettings;
   if (!validPrevious || policyChanged || settingsChanged || threadMigration) state.transaction(() => {
     const previous = validPrevious ? read() : undefined;
     const next = { version: (row?.version ?? 0) + 1,
@@ -156,6 +166,9 @@ export function createPolicyStore(config: MailConfig, state: MailState) {
       }
     }
   });
+  // Normalize an unchanged older fingerprint without resetting live edits.
+  // Future default additions no longer look like file edits.
+  if (unchangedLegacySettings) state.setMeta("runtime_config_settings", settingsHash);
   function update(document: unknown, expectedVersion: number, actor: string, settings?: unknown) {
     if (document === undefined && settings === undefined) throw new Error("provide policy or settings to update");
     const parsed = document === undefined ? undefined : parsePolicy(document);

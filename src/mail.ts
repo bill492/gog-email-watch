@@ -282,25 +282,42 @@ function decodeBody(part: GmailPart): string {
   catch { return new TextDecoder("utf-8").decode(bytes); }
 }
 
-export function bodyText(part: GmailPart): string {
-  if (part.filename) return "";
-  if (part.mimeType === "text/plain") return decodeBody(part);
-  if (part.mimeType === "text/html") {
-    return decodeEntities(decodeBody(part)
-      .replace(/<(script|style)\b[^>]*>[\s\S]*?<\/\1\s*>/gi, "")
-      .replace(/<(?:br|p|div|li|tr)\b[^>]*>/gi, "\n")
-      .replace(/<[^>]*>/g, ""));
+export function* mimeParts(root: GmailPart): Generator<GmailPart> {
+  const pending = [root];
+  while (pending.length) {
+    const part = pending.pop()!;
+    yield part;
+    const children = part.parts ?? [];
+    for (let i = children.length - 1; i >= 0; i--) pending.push(children[i]);
   }
-  if (part.mimeType === "multipart/alternative") {
-    const plain = part.parts?.find((child) => child.mimeType === "text/plain");
-    if (plain) return bodyText(plain);
-    return part.parts?.map(bodyText).find(Boolean) ?? "";
+}
+
+export function bodyText(root: GmailPart): string {
+  const text = new Map<GmailPart, string>();
+  // Postorder processing preserves MIME alternatives without recursive calls.
+  for (const part of [...mimeParts(root)].reverse()) {
+    let value = "";
+    if (!part.filename) {
+      if (part.mimeType === "text/plain") value = decodeBody(part);
+      else if (part.mimeType === "text/html") value = decodeEntities(decodeBody(part)
+        .replace(/<(script|style)\b[^>]*>[\s\S]*?<\/\1\s*>/gi, "")
+        .replace(/<(?:br|p|div|li|tr)\b[^>]*>/gi, "\n")
+        .replace(/<[^>]*>/g, ""));
+      else {
+        const children = part.parts ?? [];
+        const plain = part.mimeType === "multipart/alternative" && children.find(child => child.mimeType === "text/plain");
+        const values = children.map(child => text.get(child) ?? "");
+        value = plain ? text.get(plain) ?? "" : part.mimeType === "multipart/alternative"
+          ? values.find(Boolean) ?? "" : values.filter(Boolean).join("\n");
+      }
+    }
+    text.set(part, value);
   }
-  return (part.parts ?? []).map(bodyText).filter(Boolean).join("\n");
+  return text.get(root) ?? "";
 }
 
 export function attachmentNames(part: GmailPart): string[] {
-  return [...(part.filename ? [part.filename] : []), ...(part.parts ?? []).flatMap(attachmentNames)];
+  return [...mimeParts(part)].flatMap(part => part.filename ? [part.filename] : []);
 }
 
 export function renderThread(thread: GmailThread): string {
@@ -399,9 +416,9 @@ export class GogMailClient {
           !Array.isArray(row.labelIds) || !row.labelIds.every((label) => typeof label === "string")) {
         throw new Error("unexpected Gmail message response");
       }
-      const validatePart = (value: unknown, depth = 0): void => {
-        if (depth > 30) throw new Error("Gmail MIME nesting exceeds limit");
-        const part = record(value);
+      const parts: unknown[] = [row.payload];
+      while (parts.length) {
+        const part = record(parts.pop());
         for (const key of ["mimeType", "filename"]) if (part[key] !== undefined && typeof part[key] !== "string") throw new Error("unexpected Gmail MIME part");
         if (part.body !== undefined) {
           const body = record(part.body);
@@ -414,10 +431,9 @@ export class GogMailClient {
         }))) throw new Error("unexpected Gmail headers");
         if (part.parts !== undefined) {
           if (!Array.isArray(part.parts)) throw new Error("unexpected Gmail MIME parts");
-          for (const child of part.parts) validatePart(child, depth + 1);
+          for (const child of part.parts) parts.push(child);
         }
-      };
-      validatePart(row.payload);
+      }
       return row as unknown as GmailMessage;
     });
     let labelNames: GmailThread["labelNames"];

@@ -24,6 +24,7 @@ function dateContext() {
 export function createTriage(options: {
   config: MailConfig; state: MailState; mail: TriageMail; signal: AbortSignal;
   policies: PolicyStore;
+  mutate: <T>(work: () => Promise<T>) => Promise<T>;
   decisions?: DecisionRuntimeV1; decisionModel?: () => string | undefined;
 }) {
   const { config, state, mail, signal, policies } = options;
@@ -95,34 +96,36 @@ export function createTriage(options: {
   }
 
   async function effect(row: EffectTarget, add: string[], remove: string[], kind: "backlog" | "historical" | "labels") {
-    const policyKind = kind === "labels" ? "labels" : "action";
-    signal.throwIfAborted();
-    assertCurrent(row.policy_version, policyKind);
-    const key = hash({ id: row.id, add, remove, evidence: row.evidence_hash });
-    // A confirmed receipt describes a past write, not the current Gmail state:
-    // the user may have restored the message or removed a category since then.
-    const thread = await mail.getThread(row.thread_id);
-    const target = thread.messages.find(message => message.id === row.id);
-    signal.throwIfAborted();
-    if (!target || evidence(thread).hash !== row.evidence_hash) throw new Error("mail changed before effect; retry");
-    if (kind === "labels" && Number(target.internalDate) < mailCutoff(policies.settings().maxAgeDays)) return;
-    if (!remove.length && target.labelIds.includes("TRASH")) return;
-    const applied = add.every(label => target.labelIds.includes(label)) && remove.every(label => !target.labelIds.includes(label));
-    // Reconcile already-applied writes, but do not delete mail that left this scope.
-    if (kind !== "labels" && !applied && (target.labelIds.some(label => ["SPAM", "SENT", "DRAFT", "TRASH"].includes(label)) ||
-      (kind === "backlog" && (!target.labelIds.includes("INBOX") || Number(target.internalDate) < mailCutoff(policies.settings().maxAgeDays)))))
-      throw new Error("mail left deletion scope before effect; retry");
-    assertCurrent(row.policy_version, policyKind);
-    state.db.prepare("INSERT OR REPLACE INTO effects(id,message_id,status,intent,updated) VALUES (?,?,'pending',?,?)")
-      .run(key, row.id, JSON.stringify({ add, remove }), now());
-    try {
-      // Gmail label updates set state; lost receipts can be reconciled or retried.
-      const receipt = applied ? { reconciled: true } : await mail.modify([row.id], add, remove);
-      state.db.prepare("UPDATE effects SET status='confirmed',receipt=?,updated=? WHERE id=?").run(JSON.stringify(receipt), now(), key);
-    } catch (error) {
-      state.db.prepare("UPDATE effects SET status='uncertain',updated=? WHERE id=?").run(now(), key);
-      throw error;
-    }
+    return options.mutate(async () => {
+      const policyKind = kind === "labels" ? "labels" : "action";
+      signal.throwIfAborted();
+      assertCurrent(row.policy_version, policyKind);
+      const key = hash({ id: row.id, add, remove, evidence: row.evidence_hash });
+      // A confirmed receipt describes a past write, not the current Gmail state:
+      // the user may have restored the message or removed a category since then.
+      const thread = await mail.getThread(row.thread_id);
+      const target = thread.messages.find(message => message.id === row.id);
+      signal.throwIfAborted();
+      if (!target || evidence(thread).hash !== row.evidence_hash) throw new Error("mail changed before effect; retry");
+      if (kind === "labels" && Number(target.internalDate) < mailCutoff(policies.settings().maxAgeDays)) return;
+      if (!remove.length && target.labelIds.includes("TRASH")) return;
+      const applied = add.every(label => target.labelIds.includes(label)) && remove.every(label => !target.labelIds.includes(label));
+      // Reconcile already-applied writes, but do not delete mail that left this scope.
+      if (kind !== "labels" && !applied && (target.labelIds.some(label => ["SPAM", "SENT", "DRAFT", "TRASH"].includes(label)) ||
+        (kind === "backlog" && (!target.labelIds.includes("INBOX") || Number(target.internalDate) < mailCutoff(policies.settings().maxAgeDays)))))
+        throw new Error("mail left deletion scope before effect; retry");
+      assertCurrent(row.policy_version, policyKind);
+      state.db.prepare("INSERT OR REPLACE INTO effects(id,message_id,status,intent,updated) VALUES (?,?,'pending',?,?)")
+        .run(key, row.id, JSON.stringify({ add, remove }), now());
+      try {
+        // Gmail label updates set state; lost receipts can be reconciled or retried.
+        const receipt = applied ? { reconciled: true } : await mail.modify([row.id], add, remove);
+        state.db.prepare("UPDATE effects SET status='confirmed',receipt=?,updated=? WHERE id=?").run(JSON.stringify(receipt), now(), key);
+      } catch (error) {
+        state.db.prepare("UPDATE effects SET status='uncertain',updated=? WHERE id=?").run(now(), key);
+        throw error;
+      }
+    });
   }
   async function deleteMail(row: TriageRecord) {
     await effect(row, ["TRASH"], ["INBOX"], row.historical ? "historical" : "backlog");
@@ -149,20 +152,32 @@ export function createTriage(options: {
     }]));
     const fitted = fitEvidence(source, { account: config.account, threadId: thread.id }, questions, policies.settings());
     const batch = { state: fitted.state, questions };
-    const key = hash({ source: source.hash, model: settings.decisionModel, batch, rubric: "thread-v1" });
+    // Our own successful partial label writes change metadata, not the content
+    // being categorized. Retry the failed effects without buying inference again.
+    const limits = policies.settings();
+    const key = hash({ source: source.hash, model: settings.decisionModel, questions,
+      limits: [limits.maxInputTokens, limits.maxRequestTokens], rubric: "thread-labels-v2" });
     const answers = await evaluate(batch, "gog-email-watch.labels", key);
     const names = current.document.labels.filter((_, i) => {
       const answer = answers[`label_${i}`];
       if (answer?.type !== "choice" || !["apply", "skip"].includes(answer.choice)) throw new Error("invalid label response");
       return answer.choice === "apply";
     }).map(label => label.name);
-    const add = await Promise.all(names.map(name => mail.labelId(name)));
-    assertCurrent(current.version, "labels");
-    for (const { id } of targets) {
-      if (state.db.prepare("SELECT status FROM label_work WHERE id=?").get(id)?.status !== "pending") continue;
-      if (add.length) await effect({ id, thread_id: threadId, evidence_hash: source.hash, policy_version: current.version }, add, [], "labels");
+    const errors: string[] = [];
+    for (const name of names) {
+      try {
+        const label = await mail.labelId(name);
+        assertCurrent(current.version, "labels");
+        for (const { id } of targets) {
+          if (state.db.prepare("SELECT status FROM label_work WHERE id=?").get(id)?.status !== "pending") continue;
+          await effect({ id, thread_id: threadId, evidence_hash: source.hash, policy_version: current.version }, [label], [], "labels");
+        }
+      } catch (error) {
+        errors.push(`${name}: ${error instanceof Error ? error.message : String(error)}`);
+      }
     }
     assertCurrent(current.version, "labels");
+    if (errors.length) throw new Error(errors.join("; "));
   }
   return { policy, assess, deleteMail, scheduleLabels, label };
 }

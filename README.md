@@ -8,7 +8,9 @@ Rolling Gmail inbox triage and an optional approved-sender responder, using the 
 - **With `triage`:** Jev chooses **wake**, **queue**, **skip**, or **delete** for
   recent existing inbox mail and newly arriving inbox mail. By default, messages
   older than **30 days** are skipped in code before inference, labels or waking.
-  All senders can be classified; triage itself does not authorize sending a reply.
+  All senders can be classified. The awakened agent can reply to approved senders
+  when `settings.replyAllowed` is true (the default); classification does not expand
+  the sender allowlist.
 - **Without `triage`:** the responder handles new mail from configured senders, with full
   conversation context and an in-thread reply/skip helper. Authentication,
   self-mail, automated-message exclusions and sender activation cutoffs still
@@ -30,7 +32,8 @@ no separate scheduler, provider transport or generic queue framework.
 3. **Choose the right control:** `policy.prompt` tells Jev when to wake, queue or skip;
    `policy.deletePrompt` defines deletions; `policy.labels` defines independent
    categorization. `settings.wakePrompt` and `settings.responderPrompt` instruct
-   the agent after dispatch, not Jev.
+   the agent after dispatch, not Jev. `settings.replyAllowed` enables/disables
+   email replies in both operating modes without changing wake decisions.
 4. **Customize live:** use [Agent configuration tools](#agent-configuration-tools)
    with the version you just read. Patch only the settings you intend to change.
 5. **Verify:** read back the effective configuration, check status, and use
@@ -206,14 +209,23 @@ Policy paths below are relative to `triage.policy` in the file, or `policy` in
 
 | Field | Type / default | Purpose |
 | --- | --- | --- |
-| `prompt` | String; default text below | Instructions for Jev's wake/queue/skip/delete decision. |
+| `prompt` | String; default summarized below | Instructions for Jev's wake/queue/skip/delete decision. |
 | `deletePrompt` | String; `""` | Additional deletion criteria, used in routine triage and historical scans. Empty or whitespace-only disables deletion. |
 | `queueMinutes` | Number > 0; `1440` (24 hours) | Wake interval for queued mail. Fractions are allowed; `0` and `null` are not disable switches. |
 | `labels` | Array; `[]` | Each item requires a nonempty string `name` and a string `description`. The name is the actual Gmail label; the description tells Jev when it applies. Empty array disables new categorization requests. |
 
-The default `prompt` is:
+The default `prompt`, summarized:
 
-> Read the newest message first, then use earlier and quoted messages as history. Identify a concrete action still owed by this account, not by another recipient. Being copied on someone else's conversation, waiting for their response, or a request already answered does not create work: skip. Ignore expired meeting requests and deadlines relative to today's date unless a current unresolved consequence is stated. Wake only for owned work that cannot wait until the next queue, such as a current outage, explicit urgent request or confirmed security incident. Queue non-urgent owned work, including a pending approval, an invitation still awaiting acceptance, or a specific account configuration problem. Skip optional onboarding/marketing, routine login/download/security confirmations and general GitHub issue/CI/bot activity without an explicit request to this account. Distinguish 'please approve/fix/accept' from 'this happened; if this was you, no action is needed'. Use delete only for matches to the deletion instructions.
+> Read newest-first and identify work still owed by this account. Wake for an
+> unresolved request from an authenticated approved human sender, including a
+> simple request to reply or acknowledge; urgency is not required. Also wake for
+> owned work that cannot wait until the next queue. Queue other non-urgent owned
+> work. Skip resolved, expired and informational mail, requests addressed to someone
+> else, and optional marketing/onboarding. Use delete only for matches to the
+> deletion instructions. Read/unread, stars, labels and filenames provide context;
+> they do not prove that work is urgent or resolved.
+
+`gog_email_policy_get` returns the exact active prompt, including saved customizations.
 
 ### Actions and wakes
 
@@ -382,15 +394,17 @@ host/provider/platform constraints.
 
 | Setting | Type / default | Behavior |
 | --- | --- | --- |
+| `replyAllowed` | Boolean; `true` | Enable replies in triage and responder jobs. `false` disables sends without suppressing wakes. Live-editable; existing sender, recipient and duplicate-send checks remain. |
 | `wakePrompt` | String; `""` | Trusted snippet appended to the awakened triage agent's instructions, not sent to Jev. |
 | `responderPrompt` | String; `""` | Trusted snippet appended to new-mail responder instructions. |
 | `pollIntervalSeconds` | Integer >= 1; `120` | Live changes reschedule polling without restarting the Gateway. |
-| `concurrency` | Integer >= 1; `50` with triage, otherwise `1` | Parallel conversation workers; also used for deletion scans. Does not allow parallel agent jobs. |
+| `concurrency` | Integer >= 1; `50` with triage, otherwise `1` | Parallel conversation assessment workers; also used for deletion scans. Separate from agent execution capacity. |
+| `agentConcurrency` | Integer >= 1; `1` | Concurrent independent agent jobs. Each triage cycle remains one wake, regardless of its email count. Jobs sharing a Gmail thread stay ordered. No upper cap. |
 | `labelConcurrency` | Integer >= 1 or `null`; `null` | Independent label workers; null follows `concurrency`. |
 | `retryDelaySeconds` | Number >= 0 or `null`; `null` | Retry eligibility delay; null follows the polling interval. Retries execute on eligible polls, with no attempt ceiling. |
 | `decisionTimeoutSeconds` | Number > 0; `30` | Timeout passed to the host Decisions runtime. |
 | `gogTimeoutSeconds` | Number > 0; `90` | Timeout for each subsequent gog subprocess. |
-| `agentWaitTimeoutSeconds` | Number > 0; `660` | How long the plugin waits for an agent run; expiry does not cancel that run or replay it. |
+| `agentWaitTimeoutSeconds` | Number > 0; `660` | Maximum observation-call duration, sliced to at most 10 seconds for shutdown responsiveness. Pending runs, observation timeouts and retryable transport errors renew observation; this is not a total job runtime deadline. |
 | `gogMaxOutputBytes` | Integer >= 1; `10485760` (10 MiB) | Maximum buffered output from each gog subprocess. |
 | `discoveryOverlapSeconds` | Number >= 0; `600` | New-mail discovery overlap behind the previous poll. |
 | `reconcileIntervalSeconds` | Number > 0; `3600` | Interval between wider new-mail discovery checks. |
@@ -408,6 +422,7 @@ For example, read the current version and then call:
     "wakePrompt": "Start with deadlines and commitments; summarize the rest briefly.",
     "pollIntervalSeconds": 120,
     "concurrency": 100,
+    "agentConcurrency": 2,
     "labelConcurrency": 20,
     "retryDelaySeconds": 300,
     "decisionTimeoutSeconds": 60,
@@ -428,8 +443,10 @@ For example, `configuredSettings.labelConcurrency: null` and
 Patch only the keys you intend to change; copying effective settings into an
 update would pin inherited values.
 
-Worker counts are captured when a cycle starts; new settings affect subsequent
-cycles, requests and agent waits. Already scheduled retry timestamps are not rewritten. A shorter retry
+Assessment/label worker counts are captured when a cycle starts; new settings affect subsequent
+cycles, requests and agent waits. Increasing `agentConcurrency` immediately admits
+waiting independent jobs; lowering it lets active jobs finish before admitting more.
+The default of `1` preserves existing deployment behavior. Already scheduled retry timestamps are not rewritten. A shorter retry
 delay cannot execute faster than polling. Evidence still prefers plaintext and
 does not download attachments. Host/provider/platform limits still apply.
 
@@ -445,22 +462,62 @@ prompts remain custom: explicitly update `policy.prompt` to adopt the new defaul
 
 | Tool | Inputs | Use |
 | --- | --- | --- |
-| `gog_email_status` | `{}` | Service health, active plugin job and elapsed time, next queue/deferred eligibility, polling errors, counts and latest scan progress. No Gmail or Jev requests. |
+| `gog_email_status` | `{}` | Service health, active plugin jobs and elapsed times, next queue/deferred eligibility, polling errors, counts and latest scan progress. No Gmail or Jev requests. |
 | `gog_email_inspect` | Optional **one of** `id`, `jobId`, `scan: true` | Read-only message diagnostics, persisted job context/receipts, or latest scan results. With no selector, lists all discovered messages without a sample cap. Works without triage. |
-| `gog_email_context` | `jobId` | For triage, one entry per conversation in `messages`, with `threadId`, covered `messageIds`, classification and full transcript path. Responder jobs retain per-message entries. |
-| `gog_email_complete` | `jobId`, `reason` | Record completed work without claiming an email was sent. |
+| `gog_email_context` | `jobId` | One entry per conversation in `messages`, with `threadId`, covered `messageIds`, classification, reply permission/status, reply target and full transcript path. |
+| `gog_email_complete` | `jobId`, `reason` | Finish after handling all conversations, with or without replies. Delivery receipts are recorded separately by the reply tool. |
 | `gog_email_skip` | `jobId`, `reason` | Finish an active job when no action is needed. |
-| `gog_email_defer` | `jobId`, `reason`, `until` | Resume work at a future Unix timestamp in seconds, after fresh checks. Explicit deferral bypasses the ordinary queue interval when due; polling and active work can still delay dispatch. |
-| `gog_email_reply` | `jobId`, plaintext `body`; optional `externalScheduling`, `replyTargetMessageId`, `externalTo` | Reply in the active responder job's original thread. The account's gog signature is appended. External scheduling/recipient options retain their approved-sender authorization checks; triage prompts do not bypass them. |
-| `gog_email_resolve` | `jobId`, `note` | Close an interrupted/failed execution after reconciling its outcome. Does not repeat the run or clear send receipts. |
+| `gog_email_defer` | `jobId`, `reason`, `until` | Resume unfinished conversations at a future Unix timestamp in seconds, after fresh checks. Replied conversations stay done. Explicit deferral bypasses the ordinary queue interval when due; polling and active work can still delay dispatch. |
+| `gog_email_reply` | `jobId`, plaintext `body`; `threadId` for multi-conversation wakes; optional `externalScheduling`, `replyTargetMessageId`, `externalTo` | Reply in a covered conversation's original thread when `replyAllowed` is true. The account's gog signature is appended. Existing sender/recipient checks apply. |
+| `gog_email_resolve` | `jobId`, `note`; optional `disposition` | Reconcile an interrupted/failed execution. Default `complete` closes it; `retry` requeues only unfinished work for the next poll. Confirmed replies and send receipts are retained. |
 | `gog_email_scan` | `from`, `to` | Apply historical deletions, as described below. |
 
-Active-job tools use the dispatched job's session and `jobId`. A consolidated
-triage wake is for processing context and completing/deferring/skipping work;
-`gog_email_reply` is for the separate approved-sender responder jobs.
+Active-job tools use the dispatched job's session and `jobId`. Both responder and
+consolidated triage jobs support replies. To toggle them, call `gog_email_policy_get`,
+then patch settings using the returned version:
 
-Status's `activeJob` describes the plugin's current job, not proof that every host
-run has terminated. `startedAt`, `elapsedSeconds`, `nextQueueWakeAt` and
+```json
+{
+  "expectedVersion": 1,
+  "settings": { "replyAllowed": true }
+}
+```
+
+Replace `1` with the version just read; use `false` to disable replies. The same
+`settings` object can be set in the plugin config file. Live changes take effect
+before the next send, including in an already-running job; a send already started
+cannot be recalled. Toggling does not reclassify mail or replay completed work.
+
+In a triage wake, read `gog_email_context`, then reply to the chosen conversation:
+
+```json
+{
+  "jobId": "<active-job-id>",
+  "threadId": "<threadId-from-context>",
+  "body": "Received, thank you."
+}
+```
+
+`threadId` is optional for a single-conversation job. The default target is its
+latest covered message (`replyTargetMessageId` in context). Passing that same ID
+is also valid; selecting an earlier message is still a scheduling-only option.
+A successful reply marks that conversation done, not the whole batch. Reply to
+other conversations as needed, then `gog_email_complete`; use `gog_email_defer`
+for unfinished conversations. Different conversations can send concurrently;
+parallel attempts on the same covered target still produce at most one send.
+Context exposes each conversation's `replyAllowed`
+and `replyStatus` (`not_sent`, `sending`, `sent`, or `uncertain`); permission is
+subject to fresh Gmail sender/authentication checks at send time.
+
+Recent backlog mail admitted by triage is replyable even if it predates plugin
+activation. Sender/domain rules still apply: enabling replies does not approve
+external senders. Duplicate-send records remain per covered reply target, including
+alternate scheduling targets. An uncertain send must be reconciled before the job
+can complete or defer; other conversations can still be answered.
+
+Status's `activeJobs` lists jobs being observed by the plugin; `activeJob` is the
+first entry for compatibility. Neither proves that every other host run has
+terminated. `startedAt`, `elapsedSeconds`, `nextQueueWakeAt` and
 `nextDeferredWakeAt` use seconds; `eligibleAfter` and legacy `backlogBefore` use Unix milliseconds.
 Queue/deferred times are eligibility times, not guaranteed delivery times; null
 means no waiting work of that kind. `triageEnabled` is explicit on running services.
@@ -477,6 +534,23 @@ For diagnostics:
   the result before calling `gog_email_resolve`. Inspection does **not** reactivate
   the job or bypass active-session/send-deduplication checks. A transcript may be
   absent if execution failed before the file was written.
+
+After confirming the old host run has ended **and** the remaining work was not
+performed, deliberately retry it:
+
+```json
+{
+  "jobId": "<unresolved-job-id>",
+  "note": "Confirmed the old run ended before doing the remaining work.",
+  "disposition": "retry"
+}
+```
+
+This cancels the old job and makes unfinished messages eligible on the next poll,
+with fresh Gmail checks and a new dispatch ID. Completed conversations stay done.
+Jobs with `sending` or `uncertain` reply receipts cannot use retry: reconcile
+delivery before closing them. No send receipt is removed. Absence of a reply
+receipt does not prove the agent performed no other external action.
 
 ### Historical deletion by date range
 
@@ -497,6 +571,11 @@ It does not create queue entries, agent wakes or labeling work. All IDs are
 collected before mutations to avoid skipping mail as pagination changes, then
 grouped by thread for one deletion decision per conversation. The full chain is
 context; only eligible received messages inside the selected range can be deleted.
+Routine discovery, inference and wakes continue while a historical scan runs.
+Only Gmail page enumeration and the plugin's label/delete writes coordinate:
+page walks finish before writes can change their search results. Concurrent page
+walks are allowed, as are concurrent writes. Only one historical scan runs at a
+time; a second request returns an in-progress error and can be retried afterward.
 Failures are returned per message; rerun the range to retry. The Gateway RPC is
 `gog-email-watch.scan`, using the host's normal authenticated operator scope.
 `--timeout` is the CLI response wait in seconds (default 1800), not a limit on the
@@ -535,6 +614,10 @@ read retries it. Raw HTML, transport headers and attachment contents are not sen
 missing content, but does not force review or veto deletion.
 Mailbox metadata is a snapshot at assessment time: reading mail, starring it or applying
 labels does not itself trigger reassessment or another wake.
+Label application failures are independent: a rejected label does not prevent
+other matching labels from being applied. Retries reuse compatible cached
+classification and reconcile labels already present, rather than buying another
+Jev assessment because a Gmail write failed.
 
 Action requests also include explicit conversation `facts`: latest message ID,
 sender, sent date, whether it is from this account, the latest self-sent date,
@@ -565,15 +648,18 @@ for retry; lower the estimated budgets if a different input still exceeds Jev's
 actual token limit. Do not enable long context merely to avoid trimming.
 
 Transport deadlines, output buffer and discovery reconciliation
-are configurable above. The MIME parser retains its 30-level depth limit.
+are configurable above. MIME validation, text/filename extraction and evidence
+fingerprinting use iterative traversal, without a nesting-depth cap.
 Gmail search requests 100 IDs per **page**, then follows every page.
-The original responder still runs one agent job at a time. The default agent-run
-wait is 11 minutes; the default CLI wait for a historical scan response is 30 minutes;
+Agent capacity is controlled by `agentConcurrency`, independently of inference
+capacity. The default CLI wait for a historical scan response is 30 minutes;
 timing out is not proof the scan stopped. Agent-run and send
 receipts protect against duplicate external actions; uncertain execution is an
 operational error, not a Jev classification. Existing reply history is retained.
 Host-queued (`pending`) agent runs stay active and are observed until completion
-or the configured wait deadline; waiting never redispatches the run.
+or a terminal host failure, not a plugin wall-clock deadline. Observation timeouts
+do not revoke the job's tools or redispatch it. Stopping the watcher ends local
+observation; interrupted work still requires reconciliation after restart.
 
 ### Upgrading from the rule/review format
 
@@ -594,15 +680,17 @@ ownership check or forced 0600/0700 mode.
   decision model equals `triage.decisionModel` and its Jev provider has credentials.
   The plugin does not silently reroute email to another model.
 - **No wake:** check `gog_email_status` and `gog_email_inspect`. Messages older than
-  `maxAgeDays` skip without inference; queued mail waits for its interval; a running agent job
-  delays dispatch. Failed classification remains pending for retry rather than
+  `maxAgeDays` skip without inference; queued mail waits for its interval; occupied
+  `agentConcurrency` slots or an active job on the same thread delay dispatch.
+  Failed classification remains pending for retry rather than
   becoming a queue decision. Skipped mail never wakes; polling queued or skipped
   mail does not reclassify it.
 - **Label failure:** inspect the separate label error. Check Gmail's label rules
-  or Jev's error; action/wake processing continues independently.
+  or Jev's error; healthy labels and action/wake processing continue independently.
 - **Interrupted/uncertain execution:** inspect `unresolvedJobs` in status, then
   use `gog_email_inspect` with `jobId` to reconcile the actual agent/send outcome
-  before `gog_email_resolve`. A stored
+  before `gog_email_resolve`. Use `disposition: "retry"` only for confirmed unperformed
+  work without uncertain sends; otherwise the default closes the reconciled job. A stored
   `needs_review` execution status is not a Jev action or deletion-review mode.
 - **Historical CLI timeout:** the scan may still be running. Check `scan` in
   `gog_email_status`; retrieve saved outcomes with `gog_email_inspect({"scan":true})`

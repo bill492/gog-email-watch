@@ -1,7 +1,7 @@
 {
   "id": "gog-email-watch",
   "name": "Gog Email Watch",
-  "version": "0.3.6",
+  "version": "0.3.7",
   "description": "Rolling recent-inbox wake/queue/skip/delete triage, independent labels and optional approved-sender responses.",
   "activation": {
     "onStartup": true
@@ -151,6 +151,11 @@
         "additionalProperties": false,
         "type": "object",
         "properties": {
+          "replyAllowed": {
+            "default": true,
+            "description": "Allow in-thread replies in responder and triage jobs. Existing approved-sender and recipient checks still apply. Live-editable; false disables sends.",
+            "type": "boolean"
+          },
           "wakePrompt": {
             "default": "",
             "description": "Additional instructions for the awakened triage agent, not Jev.",
@@ -169,6 +174,12 @@
           "concurrency": {
             "minimum": 1,
             "default": 50,
+            "type": "integer"
+          },
+          "agentConcurrency": {
+            "minimum": 1,
+            "default": 1,
+            "description": "Concurrent independent agent jobs. Each triage cycle remains one wake; jobs sharing a Gmail thread stay ordered.",
             "type": "integer"
           },
           "labelConcurrency": {
@@ -210,6 +221,7 @@
           "agentWaitTimeoutSeconds": {
             "exclusiveMinimum": 0,
             "default": 660,
+            "description": "Maximum observation-call duration, sliced for shutdown responsiveness. Nonterminal timeouts renew observation; never a job runtime limit.",
             "type": "number"
           },
           "gogMaxOutputBytes": {

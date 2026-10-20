@@ -49,7 +49,9 @@ if (command[1] === 'messages' && command[2] === 'search') {
     process.stderr.write('controlled fake gog send failure\n');
     process.exit(1);
   }
-  result = fixture.send ?? { messageId: 'cc01', threadId: 'bb01' };
+  const target = command[command.indexOf('--reply-to-message-id') + 1];
+  const threadId = Object.values(fixture.threads).find(value => value.thread.messages.some(message => message.id === target))?.thread.id;
+  result = fixture.send ?? { messageId: 'cc01', threadId };
 } else if (command[1] === 'labels' && command[2] === 'list') {
   if (fixture.labelListFailure) process.exit(1);
   result = { labels: fixture.labels ?? [] };

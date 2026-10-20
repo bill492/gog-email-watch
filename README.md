@@ -526,14 +526,26 @@ timestamp is included with an explicit fallback note; it is not presented as a
 verified send time. Full conversation files use the same date representation.
 Every Jev action, deletion-scan and label prompt includes today's date and the
 Gateway process's timezone, calculated when the request is prepared rather than
-hard-coded at installation. Other headers are basic From/To/Cc/Subject;
-raw HTML, transport headers and attachment binaries are not sent. Coverage reports
+hard-coded at installation. Headers include From/To/Cc/Bcc/Reply-To/Subject when
+present (Gmail often does not expose Bcc on received mail). Each message also includes
+read/unread status, starred status, existing Gmail label names, and attachment filenames.
+Gmail's importance flag is excluded. Label IDs are retained if a name is unavailable
+or label listing fails; optional name enrichment does not block waking, and the next
+read retries it. Raw HTML, transport headers and attachment contents are not sent. Coverage reports
 missing content, but does not force review or veto deletion.
+Mailbox metadata is a snapshot at assessment time: reading mail, starring it or applying
+labels does not itself trigger reassessment or another wake.
 
 Action requests also include explicit conversation `facts`: latest message ID,
 sender, sent date, whether it is from this account, the latest self-sent date,
 and per-message sender/authentication/automation signals. Jev decides whether later
 replies actually resolve the request; the mere existence of a reply does not force skip.
+The default prompt wakes for unresolved requests directed to this account by an
+authenticated approved human sender, including simple reply/acknowledgement requests;
+explicit urgency is not required. Approval alone does not make informational or
+already-completed mail actionable. Other non-urgent owned work queues. Existing
+saved policies remain intact on upgrade; use `gog_email_policy_update` to adopt a
+changed default after previewing it.
 
 Oversized evidence drops the oldest messages first. If the newest message alone
 is too large, its beginning is retained, including its date/headers and opening

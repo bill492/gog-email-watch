@@ -53,6 +53,7 @@ type Fixture = {
   probeWritableDb?: boolean;
   modifyUncertain?: boolean;
   threadDelayMs?: number;
+  labelListFailure?: boolean;
   labels?: Array<{ id: string; name: string; type: 'user' | 'system' }>;
 };
 
@@ -333,13 +334,21 @@ test('retry deadlines and timeout overrides survive restart without replaying qu
 test('a whole chain is classified once with full plaintext, then wakes once with independent chain labels', async t => withHarness(async h => {
   t.mock.timers.enable({ apis: ['Date'], now: Date.now() });
   const body = 'TARGET_REQUEST ' + 'plain mail content '.repeat(2000) + ' END_OF_LONG_MESSAGE';
-  const target = message('aa01', body, { received: Date.now() - 60000 });
+  const target = message('aa01', body, { received: Date.now() - 60000,
+    headers: { 'Reply-To': 'reply@example.com', Bcc: 'archive@example.com', Cc: 'copy@example.com' } });
+  target.labelIds.push('UNREAD', 'STARRED', 'IMPORTANT', 'Label_existing');
+  target.payload = { mimeType: 'multipart/mixed', headers: target.payload.headers, parts: [
+    { mimeType: 'text/plain', body: target.payload.body },
+    { mimeType: 'multipart/mixed', parts: [{ mimeType: 'text/plain', filename: 'project-notes.txt',
+      body: { attachmentId: 'not-downloaded', data: Buffer.from('ATTACHMENT_CONTENT_NOT_SENT').toString('base64url') } }] },
+  ] };
   const followup = message('aa04', 'FOLLOWUP_REQUEST', { received: Date.now() - 45000 });
   const reply = message('aa02', 'ALREADY_COMPLETED: I sent the requested files.', { sender: account, received: Date.now() - 30000,
     headers: { Date: 'Mon, 19 Oct 2026 10:00:00 -0400' } });
   reply.labelIds = ['SENT'];
   const draft = message('aa03', 'UNSENT_DRAFT', { sender: account }); draft.labelIds = ['DRAFT'];
-  h.setFixture(fixture([target, followup, reply, draft], [target, followup]));
+  h.setFixture({ ...fixture([target, followup, reply, draft], [target, followup]),
+    labels: [{ id: 'Label_existing', name: 'Customer projects', type: 'user' }] });
   const provider = assessments();
   let actions = 0, labels = 0, wakes = 0;
   const decisions: DecisionRuntimeV1 = { evaluate: async (batch, options) => {
@@ -348,6 +357,11 @@ test('a whole chain is classified once with full plaintext, then wakes once with
     assert.ok(input.evidence.text.includes('FOLLOWUP_REQUEST'));
     assert.ok(input.evidence.text.includes('ALREADY_COMPLETED'), 'a long target must not crowd out the latest sent reply');
     assert.ok(!input.evidence.text.includes('UNSENT_DRAFT'));
+    for (const metadata of ['Reply-To: reply@example.com', 'Bcc: archive@example.com', 'Cc: copy@example.com',
+      'project-notes.txt', 'Customer projects', 'Read status: unread', 'Read status: read', 'Starred: true', 'Starred: false'])
+      assert.ok(input.evidence.text.includes(metadata), `action and label requests include ${metadata}`);
+    assert.ok(!input.evidence.text.includes('ATTACHMENT_CONTENT_NOT_SENT'));
+    assert.ok(!input.evidence.text.includes('IMPORTANT'), 'importance is not sent');
     const label = options.purpose.endsWith('.labels');
     if (label) labels++; else actions++;
     return { status: 'ok', provenance: { providerId: 'typesafe', rubricVersion: options.rubricVersion, runtimeGeneration: 'test' },
@@ -371,9 +385,11 @@ test('a whole chain is classified once with full plaintext, then wakes once with
     await waitFor(() => !workflow.status().triage!.labeling);
     assert.equal(actions, 1); assert.equal(labels, 1); assert.equal(wakes, 0);
     const current = await new GogMailClient(h.config).getThread('bb01');
-    assert.ok(current.messages.filter(m => ['aa01', 'aa04'].includes(m.id)).every(m => m.labelIds.includes('Label_1')));
+    assert.ok(current.messages.filter(m => ['aa01', 'aa04'].includes(m.id)).every(m => m.labelIds.includes('Label_2')));
     assert.deepEqual(current.messages.find(m => m.id === reply.id)!.labelIds, ['SENT']);
     await workflow.stop();
+    h.setFixture({ ...fixture(current.messages, current.messages.filter(m => ['aa01', 'aa04'].includes(m.id))),
+      labelListFailure: true });
     workflow = createMailWorkflow({ config, stateDir: h.stateDir, ...provider, decisions, subagent });
     await workflow.start();
     t.mock.timers.setTime(Date.now() + 120000); await workflow.poll();
@@ -1200,13 +1216,13 @@ test('date-range scans traverse all pages, delete matches only, and never queue,
     assert.deepEqual(thread.messages.find(m => m.id === outside.id)!.labelIds, ['INBOX']);
     assert.deepEqual(thread.messages.find(m => m.id === sent.id)!.labelIds, ['SENT']);
     assert.equal(thread.messages.filter(m => m.labelIds.includes('TRASH')).length, 60);
-    // Restoring mail invalidates the old effect receipt, not its classification.
+    // An explicit rescan sees changed labels: most of this chain is now in Trash.
     thread.messages.find(m => m.id === 'aa01')!.labelIds = ['INBOX'];
     h.setFixture({ ...fixture(thread.messages), probeWritableDb: false });
     const repeated = await workflow.scan({ from: '2025-01-01', to: '2026-01-01' });
     assert.equal(repeated.deleted, 1); assert.equal(repeated.failed, 0);
     assert.ok((await new GogMailClient(h.config).getThread('bb01')).messages.find(m => m.id === 'aa01')!.labelIds.includes('TRASH'));
-    assert.equal(provider.calls(), 2, 'unchanged scan instructions and evidence reuse classification');
+    assert.equal(provider.calls(), 3, 'explicit rescans classify changed Gmail metadata');
     assert.equal(h.calls().filter(args => args.includes('modify')).length, 61);
   } finally { await workflow.stop(); }
 }));
@@ -1323,7 +1339,8 @@ test('full plaintext and attachments are classified without review vetoes; uncer
     assert.deepEqual(inspected.coverage, { complete: false, missing: ['unscanned attachment'] });
     await workflow.stop();
     workflow = createMailWorkflow({ config, stateDir: h.stateDir, ...provider, decisions, subagent });
-    await workflow.start(); assert.equal(workflow.status().messages.done, 1); assert.equal(provider.calls(), 1);
+    await workflow.start(); assert.equal(workflow.status().messages.done, 1);
+    assert.equal(provider.calls(), 2, 'retry sees the changed Trash metadata; the effect still reconciles without another write');
     assert.equal(h.calls().filter(args => args.includes('modify')).length, 1);
     assert.equal(workflow.inspect('aa02')[0].effects[0].status, 'confirmed');
     const thread = await new GogMailClient(h.config).getThread('bb01');

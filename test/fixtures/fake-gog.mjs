@@ -51,6 +51,7 @@ if (command[1] === 'messages' && command[2] === 'search') {
   }
   result = fixture.send ?? { messageId: 'cc01', threadId: 'bb01' };
 } else if (command[1] === 'labels' && command[2] === 'list') {
+  if (fixture.labelListFailure) process.exit(1);
   result = { labels: fixture.labels ?? [] };
 } else if (command[1] === 'labels' && command[2] === 'create') {
   const label = { name: command[3], id: `Label_${(fixture.labels?.length ?? 0) + 1}` };

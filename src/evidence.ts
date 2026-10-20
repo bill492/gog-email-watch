@@ -1,4 +1,4 @@
-import { bodyText, sentDate, type GmailPart, type GmailThread } from "./mail.js";
+import { attachmentNames, bodyText, sentDate, type GmailPart, type GmailThread } from "./mail.js";
 import { hash } from "./policy.js";
 import type { RuntimeSettings } from "./policy.js";
 import type { DecisionBatch, JsonValue } from "openclaw/plugin-sdk/decisions";
@@ -17,17 +17,24 @@ export function evidence(thread: GmailThread) {
   }
   const messages = thread.messages.filter(message => !message.labelIds.includes("DRAFT"))
     .sort((a, b) => Number(a.internalDate) - Number(b.internalDate) || a.id.localeCompare(b.id));
-  // Our own labels must not invalidate the conversation's assessment.
-  const fingerprint = hash({ format: 3, threadId: thread.id, messages: messages.map(({ id, internalDate, payload }) => ({ id, internalDate, payload })) });
+  // Mailbox metadata is a snapshot, not new conversation content. Reading mail or
+  // applying our own labels must not invalidate the assessment and repeat a wake.
+  const fingerprint = hash({ format: 4, threadId: thread.id, messages: messages.map(({ id, internalDate, payload }) => ({ id, internalDate, payload })) });
   const sections = messages.map(message => {
     scan(message.payload);
     const body = bodyText(message.payload).trim();
     if (!body) missing.add("missing inline body");
-    const headers = (message.payload.headers ?? []).filter(header => ["from", "to", "cc", "subject"].includes(header.name.toLowerCase()));
-    return [`Sent date: ${sentDate(message)}`, `Message ID: ${message.id}`, ...headers.map(header => `${header.name}: ${header.value}`), "", body].join("\n");
+    const headers = (message.payload.headers ?? []).filter(header => ["from", "to", "cc", "bcc", "reply-to", "subject"].includes(header.name.toLowerCase()));
+    const names = attachmentNames(message.payload);
+    const labels = message.labelIds.filter(id => id !== "IMPORTANT").map(id => thread.labelNames?.[id] ?? id);
+    return [`Sent date: ${sentDate(message)}`, `Message ID: ${message.id}`, ...headers.map(header => `${header.name}: ${header.value}`),
+      `Read status: ${message.labelIds.includes("UNREAD") ? "unread" : "read"}`,
+      `Starred: ${message.labelIds.includes("STARRED")}`,
+      `Gmail labels: ${JSON.stringify(labels)}`,
+      ...(names.length ? [`Attachments (filenames only; contents not scanned): ${JSON.stringify(names)}`] : []), "", body].join("\n");
   });
   return {
-    content: { format: 3, threadId: thread.id, text: sections.join("\n\n---\n\n") }, hash: fingerprint,
+    content: { format: 4, threadId: thread.id, text: sections.join("\n\n---\n\n") }, hash: fingerprint,
     complete: missing.size === 0, missing: [...missing], sections,
   };
 }

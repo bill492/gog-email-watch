@@ -42,6 +42,7 @@ export interface GmailPart {
 export interface GmailThread {
   id: string;
   messages: GmailMessage[];
+  labelNames?: Record<string, string>;
 }
 
 export interface SearchMessage {
@@ -298,7 +299,7 @@ export function bodyText(part: GmailPart): string {
   return (part.parts ?? []).map(bodyText).filter(Boolean).join("\n");
 }
 
-function attachmentNames(part: GmailPart): string[] {
+export function attachmentNames(part: GmailPart): string[] {
   return [...(part.filename ? [part.filename] : []), ...(part.parts ?? []).flatMap(attachmentNames)];
 }
 
@@ -346,6 +347,7 @@ function plainTextToHtml(text: string): string {
 
 export class GogMailClient {
   private readonly labelLookups = new Map<string, Promise<string>>();
+  private labelCatalog?: Promise<Map<string, string>>;
   constructor(private readonly config: MailConfig, private readonly signal?: AbortSignal,
     private readonly settings: () => RuntimeSettings = () => effectiveSettings({ ...defaultSettings, ...config.settings })) {}
 
@@ -418,7 +420,27 @@ export class GogMailClient {
       validatePart(row.payload);
       return row as unknown as GmailMessage;
     });
-    return { id, messages };
+    let labelNames: GmailThread["labelNames"];
+    try { labelNames = Object.fromEntries(await this.listLabels()); }
+    catch {
+      this.signal?.throwIfAborted();
+      // Optional name enrichment must not block triage or responding. IDs remain
+      // available in the thread, and the next read retries the catalog.
+    }
+    return { id, messages, labelNames };
+  }
+
+  private listLabels(): Promise<Map<string, string>> {
+    // Share concurrent reads, but refresh on the next fetch so renames are visible.
+    return this.labelCatalog ??= this.gog(["gmail", "labels", "list"]).then(value => {
+      const data = record(value);
+      if (!Array.isArray(data.labels)) throw new Error("invalid Gmail labels response");
+      return new Map(data.labels.map(item => {
+        const label = record(item);
+        if (typeof label.id !== "string" || !label.id || typeof label.name !== "string") throw new Error("invalid Gmail label");
+        return [label.id, label.name];
+      }));
+    }).finally(() => { this.labelCatalog = undefined; });
   }
 
   labelId(name: string): Promise<string> {
@@ -432,9 +454,8 @@ export class GogMailClient {
   }
 
   private async findLabel(name: string): Promise<string> {
-    const data = record(await this.gog(["gmail", "labels", "list"]));
-    if (!Array.isArray(data.labels)) throw new Error("invalid Gmail labels response");
-    const found = data.labels.map(record).find(label => label.name === name);
+    const match = [...await this.listLabels()].find(([, labelName]) => labelName === name);
+    const found = match && { id: match[0] };
     const label = found ?? record(record(await this.gog(["gmail", "labels", "create", name])).label);
     if (typeof label.id !== "string" || !label.id) throw new Error("invalid Gmail label ID");
     if (["INBOX", "SPAM", "TRASH", "SENT", "DRAFT"].includes(label.id))

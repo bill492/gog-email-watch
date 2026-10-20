@@ -31,7 +31,7 @@ export default definePluginEntry({
 
     api.registerService({
       id: "gog-email-watch",
-      async start(ctx) {
+      start(ctx) {
         const config = parseConfig(api.pluginConfig);
         const mailboxKey = createHash("sha256").update(config.account).digest("hex").slice(0, 16);
         workflow = createMailWorkflow({
@@ -46,7 +46,8 @@ export default definePluginEntry({
           },
           logger: ctx.logger,
         });
-        await workflow.start();
+        // Gateway activation must not wait for a mailbox scan or inference.
+        void workflow.start().catch(error => ctx.logger.error(`gog-email-watch: startup failed: ${String(error)}`));
       },
       async stop() {
         await workflow?.stop();

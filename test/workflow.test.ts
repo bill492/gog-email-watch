@@ -150,13 +150,20 @@ function withHarness(fn: (h: {
   });
 }
 
-test('registered service honors the canonical per-agent decision model before inference', async () => withHarness(async (h) => {
+test('registered service starts without waiting for inference and honors the canonical per-agent model', async () => withHarness(async (h) => {
   const provider = assessments();
+  let release!: () => void;
+  const inference = new Promise<void>(resolve => { release = resolve; });
+  const decisions: DecisionRuntimeV1 = { evaluate: async (...args) => {
+    const result = provider.decisions.evaluate(...args);
+    await inference;
+    return result;
+  } };
   const config = { agents: { defaults: { decisionModel: 'other/wrong' }, entries: { main: { decisionModel: 'typesafe/jev-1.13.0' } } } };
   let service: Parameters<OpenClawPluginApi['registerService']>[0] | undefined;
   const api = {
     pluginConfig: triageConfig(h.config),
-    runtime: { config: { current: () => config }, decisions: provider.decisions, subagent: {} },
+    runtime: { config: { current: () => config }, decisions, subagent: {} },
     registerService(value: Parameters<OpenClawPluginApi['registerService']>[0]) { service = value; },
     registerTool() {}, registerCommand() {}, registerGatewayMethod() {}, registerCli() {},
   } as unknown as OpenClawPluginApi;
@@ -164,10 +171,13 @@ test('registered service honors the canonical per-agent decision model before in
   assert.ok(service);
   h.setFixture({ ...fixture([message('aa01', 'Please review the estimate', { received: Date.now() - 60000 })]), probeWritableDb: false });
   const context = { config: {}, stateDir: h.stateDir, logger: { info() {}, warn() {}, error() {}, debug() {} } };
+  let ready = false;
+  const started = Promise.resolve(service.start(context)).then(() => { ready = true; });
   try {
-    await service.start(context);
+    await waitFor(() => provider.calls() === 1);
+    assert.equal(ready, true, 'Gateway activation must not wait for mailbox work');
     assert.equal(provider.calls(), 1, 'per-agent model must override the different default');
-  } finally { await service.stop?.(context); }
+  } finally { release(); await started; await service.stop?.(context); }
 }));
 
 test('policy tools support ordinary and delegated agents without owner context while retaining version checks', async () => withHarness(async (h) => {

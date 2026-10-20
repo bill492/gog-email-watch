@@ -1,6 +1,6 @@
 {
   "name": "@unblocklabs/gog-email-watch",
-  "version": "0.3.1",
+  "version": "0.3.2",
   "license": "MIT",
   "description": "Gmail backlog wake/queue/delete triage, independent labels, and approved-sender agent workflows through gog.",
   "type": "module",

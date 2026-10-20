@@ -1714,7 +1714,9 @@ test('a large old-mail cycle drains all pages with configured concurrency, one w
   const started = workflow.start();
   try {
     await waitFor(() => calls >= 50); release();
-    await started; await waitFor(() => !workflow.status().working);
+    // This fixture spawns hundreds of real CLI processes; completion is the
+    // contract, not a five-second wall-clock deadline on a shared CI runner.
+    await started; await waitFor(() => !workflow.status().working, 30000);
     // Real Gmail treats after:0 as an empty result, not an unbounded search.
     assert.ok(h.calls().filter(args => args.includes('search')).every(args =>
       !args[args.indexOf('search') + 1].split(/\s+/).includes('after:0')));

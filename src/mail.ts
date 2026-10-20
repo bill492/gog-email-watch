@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { promisify } from "node:util";
 import emailAddresses from "email-addresses";
-import { defaultSettings, effectiveSettings, parseSettings, parseTriage, type Facts, type RuntimeSettings, type SettingsPatch, type TriageConfig } from "./policy.js";
+import { defaultSettings, effectiveSettings, parseSettings, parseTriage, type RuntimeSettings, type SettingsPatch, type TriageConfig } from "./policy.js";
 
 const run = promisify(execFile);
 const excludedLabels = new Set(["SPAM", "TRASH", "SENT", "DRAFT"]);
@@ -161,10 +161,21 @@ function senderSignals(message: GmailMessage) {
   return { sender, domain, authentication, automation };
 }
 
-export function mailFacts(message: GmailMessage, config: MailConfig, thread?: GmailThread): Facts {
-  const { sender, domain, authentication, automation } = senderSignals(message);
-  const authenticated = authentication === undefined, automated = automation !== undefined;
-  return { sender, domain, authenticated, automated, conversationReply: conversationReply(message, config, thread), approved: !!sender && authenticated && !automated && !config.selfAddresses.includes(sender) && (config.domains.includes(domain) || config.senders.includes(sender)), labels: message.labelIds };
+export function threadFacts(thread: GmailThread, config: MailConfig) {
+  const sent = thread.messages.filter(item => !item.labelIds.includes("DRAFT"))
+    .sort((a, b) => Number(b.internalDate) - Number(a.internalDate) || a.id.localeCompare(b.id));
+  const fromSelf = (item: GmailMessage) => config.selfAddresses.includes(senderAddress(item));
+  const latest = sent[0];
+  const latestSelf = sent.find(fromSelf);
+  return { latestMessageId: latest?.id ?? null, latestSender: latest ? senderAddress(latest) : null,
+    latestSentDate: latest ? sentDate(latest) : null, latestFromSelf: latest ? fromSelf(latest) : false,
+    latestSelfSentDate: latestSelf ? sentDate(latestSelf) : null,
+    messages: sent.map(message => {
+      const { sender, domain, authentication, automation } = senderSignals(message);
+      const authenticated = authentication === undefined, automated = automation !== undefined;
+      return { id: message.id, sender, authenticated, automated, fromSelf: fromSelf(message),
+        approved: !!sender && authenticated && !automated && !fromSelf(message) && (config.domains.includes(domain) || config.senders.includes(sender)) };
+    }) };
 }
 
 export function sendReceipt(value: unknown, threadId: string): { messageId: string; threadId: string } {
@@ -331,8 +342,7 @@ function plainTextToHtml(text: string): string {
 export class GogMailClient {
   private readonly labelLookups = new Map<string, Promise<string>>();
   constructor(private readonly config: MailConfig, private readonly signal?: AbortSignal,
-    private readonly settings: () => RuntimeSettings = () => effectiveSettings({ ...defaultSettings, ...config.settings,
-      evidence: { ...defaultSettings.evidence, ...config.settings?.evidence } })) {}
+    private readonly settings: () => RuntimeSettings = () => effectiveSettings({ ...defaultSettings, ...config.settings })) {}
 
   private async gog(args: string[]): Promise<unknown> {
     const settings = this.settings();

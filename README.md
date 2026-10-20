@@ -206,6 +206,12 @@ The default `prompt` is:
 
 ### Actions and wakes
 
+**The classification unit is a Gmail thread, not an individual message.** Jev
+receives the full plaintext chain in chronological order and returns one action
+for that conversation. Discovery groups messages across all pages before inference.
+Ten eligible messages in one chain mean one action request, not ten. Each message
+still has its own status and mutation receipt for inspection and reliable retries.
+
 - **wake:** all wake results from one completed processing cycle produce **one
   agent run**, across all threads. No message-count threshold or size cap.
 - **queue:** wait for `queueMinutes`, then include all waiting items in one wake.
@@ -215,10 +221,12 @@ The default `prompt` is:
   running agent job can delay delivery.
 - **skip:** keep the message untouched without creating a job or waking the agent.
   Independent labels can still apply. The result persists across polls and restarts;
-  explicit classification-policy or evidence changes can reconsider skipped mail.
+  explicit classification-policy changes can reconsider skipped mail.
   This is Jev's classification, distinct from `gog_email_skip`, which finishes an
   agent job that has already been dispatched.
-- **delete:** move the matched **message** to Gmail Trash, removing INBOX.
+- **delete:** when the conversation matches the deletion instructions, move its
+  eligible backlog **messages** to Gmail Trash, removing INBOX. Sent mail, drafts,
+  newer mail and messages outside the scan range are context, not deletion targets.
   No archive action, forced review, quarantine, protected-category veto, or
   confidence threshold. No permanent-delete or purge endpoint; Gmail's normal
   Trash retention applies.
@@ -235,12 +243,17 @@ mail must still be in Inbox; historical scans may also delete archived mail.
 Classification failures remain pending and retry on later polls;
 there is no attempt ceiling, daily inference allowance or plugin dollar cap.
 
-Polling and the queue wake interval do not reclassify successfully queued or skipped mail.
-An unchanged email normally needs one action request, plus one independent label
+Polling does not reclassify successfully queued or skipped mail. Immediately before
+dispatching a wake, the plugin fetches the current threads and checks mailbox scope.
+Only changed threads are reassessed: resolved items can become skip, urgent items
+can return to queue, and removed/archived items leave the wake. Unchanged threads
+reuse their decisions, even on a later day. Read/inference failures retry without
+waking on stale evidence or postponing already-due work for another queue interval.
+An unchanged chain normally needs one action request, plus one independent label
 request if labels are configured (all label definitions share that request).
 For example, two-minute polls do not generate a Jev request every two minutes.
 Setting `queueMinutes` to 2 delivers queued mail in a consolidated agent wake when
-due; it does not ask Jev to choose again. Failed requests retry, and prompt changes
+due; unchanged threads do not ask Jev to choose again. Failed requests retry, and prompt changes
 can reclassify undispatched work, including skipped mail. Successful identical
 assessments are cached with the current date: an explicit reassessment on a later
 day (for example, a deferred job or repeated deletion scan) uses that day's context.
@@ -253,8 +266,10 @@ will still encourage unnecessary queue wakes despite the available `skip` choice
 ### Independent labels
 
 Each label has its actual Gmail `name` and a categorization `description`.
-Jev receives these in a **separate request** from the action decision, returning
-apply/skip per label. Multiple labels can apply to a wake, queue or skipped item.
+Jev receives these in a **separate request per chain** from the action decision,
+returning apply/skip per label. Matching labels are applied to the eligible tracked
+messages, not sent messages or newer replies included only for context. Multiple
+labels can apply to a wake, queue or skipped conversation.
 
 Label inference and Gmail writes are asynchronous relative to wake dispatch.
 A slow or failed label request does not change the action or block waking.
@@ -291,8 +306,8 @@ with its returned `version` as `expectedVersion` and at least one of:
   `queueMinutes` and `labels`. Preserve the current document's fields you are not
   changing. The get result calls this object `document`; the update input calls
   it `policy`.
-- **`settings`: partial patch.** Omitted keys stay unchanged, including keys inside
-  `evidence`. You can send policy and settings together in one versioned update.
+- **`settings`: partial patch.** Omitted keys stay unchanged. You can send policy
+  and settings together in one versioned update.
 
 For example, to replace the policy with hourly queue wakes and one category:
 
@@ -330,7 +345,7 @@ Account, sender lists, aliases, agent routing, executable path, triage enablemen
 decision-model selection and the external-reply toggle remain file configuration.
 Live tools do not edit them. Preserve the state directory when upgrading.
 
-Classification-prompt or evidence edits reclassify work not yet dispatched, including skipped mail; label
+Classification-prompt edits reclassify work not yet dispatched, including skipped mail; label
 edits refresh labeling independently. Queue timing, wake/responder snippets,
 concurrency and transport edits do not reclassify mail or invalidate compatible
 in-flight assessments. Completed agent jobs and sends are never replayed.
@@ -342,7 +357,7 @@ through `gog_email_policy_update`. These tools also work on responder-only insta
 Existing `pollIntervalSeconds` and `triage.concurrency` remain supported as file
 defaults; explicit `settings` values take precedence.
 
-Every key below belongs inside `settings`; `evidence` is a nested object. Seconds
+Every key below belongs inside `settings`. Seconds
 are seconds, bytes are UTF-8 bytes, and only `queueMinutes` above uses minutes.
 There are no plugin upper caps; values must satisfy the types below and the actual
 host/provider/platform constraints.
@@ -352,14 +367,12 @@ host/provider/platform constraints.
 | `wakePrompt` | String; `""` | Trusted snippet appended to the awakened triage agent's instructions, not sent to Jev. |
 | `responderPrompt` | String; `""` | Trusted snippet appended to new-mail responder instructions. |
 | `pollIntervalSeconds` | Integer >= 1; `120` | Live changes reschedule polling without restarting the Gateway. |
-| `concurrency` | Integer >= 1; `50` with triage, otherwise `1` | Parallel action/discovery workers; also used for deletion scans. Does not allow parallel agent jobs. |
+| `concurrency` | Integer >= 1; `50` with triage, otherwise `1` | Parallel conversation workers; also used for deletion scans. Does not allow parallel agent jobs. |
 | `labelConcurrency` | Integer >= 1 or `null`; `null` | Independent label workers; null follows `concurrency`. |
 | `retryDelaySeconds` | Number >= 0 or `null`; `null` | Retry eligibility delay; null follows the polling interval. Retries execute on eligible polls, with no attempt ceiling. |
 | `decisionTimeoutSeconds` | Number > 0; `30` | Timeout passed to the host Decisions runtime. |
 | `gogTimeoutSeconds` | Number > 0; `90` | Timeout for each subsequent gog subprocess. |
 | `agentWaitTimeoutSeconds` | Number > 0; `660` | How long the plugin waits for an agent run; expiry does not cancel that run or replay it. |
-| `evidence.maxBytes` | Integer >= 1; `16000` | Encoded evidence size, excluding policy/questions; must also be large enough to fit the metadata envelope. Too small causes a visible assessment error. |
-| `evidence.context` | `"message"` or `"thread"`; `"thread"` | `"message"` sends only the target; `"thread"` adds recent conversation context after it. |
 | `gogMaxOutputBytes` | Integer >= 1; `10485760` (10 MiB) | Maximum buffered output from each gog subprocess. |
 | `discoveryOverlapSeconds` | Number >= 0; `600` | New-mail discovery overlap behind the previous poll. |
 | `reconcileIntervalSeconds` | Number > 0; `3600` | Interval between wider new-mail discovery checks. |
@@ -377,7 +390,6 @@ For example, read the current version and then call:
     "labelConcurrency": 20,
     "retryDelaySeconds": 300,
     "decisionTimeoutSeconds": 60,
-    "evidence": { "maxBytes": 16000, "context": "message" },
     "gogMaxOutputBytes": 20971520
   }
 }
@@ -400,13 +412,19 @@ cycles, requests and agent waits. Already scheduled retry timestamps are not rew
 delay cannot execute faster than polling. Evidence still prefers plaintext and
 does not download attachments. Host/provider/platform limits still apply.
 
+Legacy `settings.evidence.maxBytes` and `settings.evidence.context` fields are
+accepted but ignored; remove them when convenient. They cannot truncate a chain.
+On first upgrade to thread classification, undispatched message-level decisions
+are reconsidered as conversations. Completed or uncertain agent executions and
+send receipts are preserved, as are live settings and the original backlog cutoff.
+
 ### Job and diagnostic tools
 
 | Tool | Inputs | Use |
 | --- | --- | --- |
 | `gog_email_status` | `{}` | Service health, active plugin job and elapsed time, next queue/deferred eligibility, polling errors, counts and latest scan progress. No Gmail or Jev requests. |
 | `gog_email_inspect` | Optional **one of** `id`, `jobId`, `scan: true` | Read-only message diagnostics, persisted job context/receipts, or latest scan results. With no selector, lists all discovered messages without a sample cap. Works without triage. |
-| `gog_email_context` | `jobId` | Messages, classifications and full conversation file paths for the active job. |
+| `gog_email_context` | `jobId` | For triage, one entry per conversation in `messages`, with `threadId`, covered `messageIds`, classification and full transcript path. Responder jobs retain per-message entries. |
 | `gog_email_complete` | `jobId`, `reason` | Record completed work without claiming an email was sent. |
 | `gog_email_skip` | `jobId`, `reason` | Finish an active job when no action is needed. |
 | `gog_email_defer` | `jobId`, `reason`, `until` | Resume work at a future Unix timestamp in seconds, after fresh checks. Explicit deferral bypasses the ordinary queue interval when due; polling and active work can still delay dispatch. |
@@ -453,7 +471,9 @@ lookback-window, result-count or page cap.
 
 This **applies deletions** matching `deletePrompt`; nonmatches stay untouched.
 It does not create queue entries, agent wakes or labeling work. All IDs are
-collected before mutations to avoid skipping mail as pagination changes.
+collected before mutations to avoid skipping mail as pagination changes, then
+grouped by thread for one deletion decision per conversation. The full chain is
+context; only eligible received messages inside the selected range can be deleted.
 Failures are returned per message; rerun the range to retry. The Gateway RPC is
 `gog-email-watch.scan`, using the host's normal authenticated operator scope.
 `--timeout` is the CLI response wait in seconds (default 1800), not a limit on the
@@ -475,10 +495,9 @@ scan replay is added.
 
 ### Evidence and actual technical bounds
 
-Jev sees trimmed plaintext, preferring the MIME plaintext alternative and converting
-HTML only when necessary. The target comes first, followed by recent thread context.
-By default, the first **16,000 JSON-encoded UTF-8 bytes** of evidence are sent to fit the Jev
-integration that rejected larger inputs. Each message starts with its sent date
+Jev sees the **full plaintext conversation, without a plugin byte or token cap**,
+preferring the MIME plaintext alternative and converting HTML only when necessary.
+Messages are chronological; draft bodies are excluded. Each message starts with its sent date
 (the sender-provided `Date` header, retaining its timezone). If missing, Gmail's
 timestamp is included with an explicit fallback note; it is not presented as a
 verified send time. Full conversation files use the same date representation.
@@ -486,13 +505,22 @@ Every Jev action, deletion-scan and label prompt includes today's date and the
 Gateway process's timezone, calculated when the request is prepared rather than
 hard-coded at installation. Other headers are basic From/To/Cc/Subject;
 raw HTML, transport headers and attachment binaries are not sent. Coverage reports
-truncation/missing content, but does not force review or veto deletion.
+missing content, but does not force review or veto deletion.
 
-Prompt and label definitions are not truncated. Very large instructions may exceed
-the provider's actual context window and fail; that error remains visible and
-retryable instead of silently changing the policy.
+Action requests also include explicit conversation `facts`: latest message ID,
+sender, sent date, whether it is from this account, the latest self-sent date,
+and per-message sender/authentication/automation signals. Jev decides whether later
+replies actually resolve the request; the mere existence of a reply does not force skip.
 
-Transport deadlines, output buffer, evidence size and discovery reconciliation
+Neither evidence nor prompt/label definitions are truncated. Requests exceeding
+the provider's actual context window fail visibly rather than silently losing
+content. [Jev's documented default limits](https://docs.typesafe.ai/models#context-length)
+are 32k tokens for state plus one question and 64k for state plus all questions.
+Optional long context raises both to 262k; the installed OpenClaw TypeSafe provider
+does not enable that header and separately limits JSON requests to 4 MiB. Removing
+the email plugin's truncation does not change those upstream limits.
+
+Transport deadlines, output buffer and discovery reconciliation
 are configurable above. The MIME parser retains its 30-level depth limit.
 Gmail search requests 100 IDs per **page**, then follows every page.
 The original responder still runs one agent job at a time. The default agent-run

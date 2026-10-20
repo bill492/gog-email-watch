@@ -1,7 +1,7 @@
 {
   "id": "gog-email-watch",
   "name": "Gog Email Watch",
-  "version": "0.3.3",
+  "version": "0.3.4",
   "description": "Old-mail wake/queue/skip/delete triage, independent labels and approved-sender responses.",
   "activation": {
     "onStartup": true
@@ -233,16 +233,14 @@
           },
           "evidence": {
             "additionalProperties": false,
+            "deprecated": true,
+            "description": "Legacy settings, ignored. Jev always receives the full plaintext conversation without truncation.",
             "type": "object",
             "properties": {
               "maxBytes": {
-                "minimum": 1,
-                "default": 16000,
-                "description": "JSON-encoded evidence bytes, excluding prompts and questions.",
                 "type": "integer"
               },
               "context": {
-                "default": "thread",
                 "anyOf": [
                   {
                     "const": "message",

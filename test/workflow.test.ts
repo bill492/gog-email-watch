@@ -660,7 +660,6 @@ test('new mail uses full chronological thread and a stable session, then sends o
 }));
 
 test('duplicate mail and restart do not dispatch again; an explicit skip completes a job', async () => withHarness(async (h) => {
-  const incoming = message('aa01', 'No reply is needed.');
   h.setFixture(fixture([]));
   let runs = 0;
   let workflow: ReturnType<typeof createMailWorkflow>;
@@ -673,20 +672,22 @@ test('duplicate mail and restart do not dispatch again; an explicit skip complet
     waitForRun: async () => ({ status: 'ok' }),
   };
   workflow = createMailWorkflow({ config: h.config, stateDir: h.stateDir, subagent });
-  await workflow.start();
-  h.setFixture(fixture([incoming]));
-  await workflow.poll();
-  await waitFor(() => workflow.status().jobs.skipped === 1);
-  await workflow.stop();
-  workflow = createMailWorkflow({ config: h.config, stateDir: h.stateDir, subagent });
-  await workflow.start();
-  await workflow.poll();
-  assert.equal(runs, 1);
-  assert.equal(h.calls().filter((args) => args.includes('send')).length, 0);
-  const db = h.db();
-  assert.equal((db.prepare("SELECT status FROM jobs").get() as { status: string }).status, 'skipped');
-  db.close();
-  await workflow.stop();
+  try {
+    await workflow.start();
+    const incoming = message('aa01', 'No reply is needed.');
+    h.setFixture(fixture([incoming]));
+    await workflow.poll();
+    await waitFor(() => workflow.status().jobs.skipped === 1);
+    await workflow.stop();
+    workflow = createMailWorkflow({ config: h.config, stateDir: h.stateDir, subagent });
+    await workflow.start();
+    await workflow.poll();
+    assert.equal(runs, 1);
+    assert.equal(h.calls().filter((args) => args.includes('send')).length, 0);
+    const db = h.db();
+    assert.equal((db.prepare("SELECT status FROM jobs").get() as { status: string }).status, 'skipped');
+    db.close();
+  } finally { await workflow.stop(); }
 }));
 
 test('only authorized human mail dispatches; unreadable threads retry after restart without blocking healthy mail', async () => withHarness(async h => {

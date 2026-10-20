@@ -2,7 +2,7 @@ import { mkdirSync } from "node:fs";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 
-export type MessageStatus = "pending" | "queued" | "wake" | "queue" | "ignored" | "processing" | "done" | "failed" | "needs_review" | "shadow" | "digest" | "deferred";
+export type MessageStatus = "pending" | "queued" | "wake" | "queue" | "skipped" | "ignored" | "processing" | "done" | "failed" | "needs_review" | "shadow" | "digest" | "deferred";
 export type JobStatus = "queued" | "running" | "replied" | "skipped" | "completed" | "deferred" | "failed" | "interrupted" | "cancelled" | "needs_review";
 
 export interface StoredMessage {

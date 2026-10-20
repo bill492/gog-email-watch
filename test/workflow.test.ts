@@ -278,14 +278,14 @@ test('live settings reschedule polling, tune discovery and survive restarts with
 }));
 
 test('evidence settings and retry deadlines change real assessments without replaying queued work', async t => withHarness(async h => {
-  t.mock.timers.enable({ apis: ['Date'], now: Date.now() });
+  t.mock.timers.enable({ apis: ['Date'], now: new Date(2026, 9, 19, 12).getTime() });
   const target = message('aa02', 'TARGET ' + '😀'.repeat(300) + ' TAIL', { received: Date.now() - 60000 });
-  const sibling = message('aa01', 'SIBLING_CONTEXT', { received: Date.now() - 120000 });
+  const sibling = message('aa01', 'SIBLING_CONTEXT', { received: Date.parse('2026-09-24T10:00:00Z'), headers: { Date: '' } });
   h.setFixture(fixture([sibling, target], [target]));
-  const requests: Array<{ evidence: string; timeout: number }> = [];
+  const requests: Array<{ evidence: string; instructions: string; timeout: number }> = [];
   const provider = assessments();
   const decisions: DecisionRuntimeV1 = { evaluate: async (batch, opts) => {
-    requests.push({ evidence: JSON.stringify((batch.state as { evidence: unknown }).evidence), timeout: opts.timeoutMs });
+    requests.push({ evidence: JSON.stringify((batch.state as { evidence: unknown }).evidence), instructions: JSON.stringify(batch.questions), timeout: opts.timeoutMs });
     if (requests.length === 1) return { status: 'unavailable', reason: 'transport' };
     return provider.decisions.evaluate(batch, opts);
   } };
@@ -303,6 +303,8 @@ test('evidence settings and retry deadlines change real assessments without repl
     assert.equal(requests[1].timeout, 12500);
     assert.ok(Buffer.byteLength(requests[1].evidence) <= 1024);
     assert.ok(requests[1].evidence.includes('TARGET') && !requests[1].evidence.includes('TAIL'));
+    assert.ok(requests[1].evidence.includes('Sent date: Fri, 25 Sep 2026 10:00:00 -0400'));
+    assert.match(requests[1].instructions, /Today's date: 2026-10-19 \([^)]+\)/);
     assert.ok(!requests[1].evidence.includes('SIBLING_CONTEXT'));
     workflow.policyUpdate(undefined, 1, 'main', { wakePrompt: 'Handle succinctly', decisionTimeoutSeconds: 45, concurrency: 3 });
     await workflow.poll(); assert.equal(requests.length, 2, 'operational settings do not reclassify queue');
@@ -310,11 +312,63 @@ test('evidence settings and retry deadlines change real assessments without repl
     await workflow.poll();
     assert.equal(requests.length, 3); assert.equal(requests[2].timeout, 45000);
     assert.ok(requests[2].evidence.includes('TAIL') && requests[2].evidence.includes('SIBLING_CONTEXT'));
+    assert.ok(requests[2].evidence.includes('2026-09-24T10:00:00.000Z (Gmail timestamp; sent Date header missing)'));
+    assert.match(readFileSync(join(h.stateDir, 'triage', 'aa02.md'), 'utf8'), /Sent date: 2026-09-24T10:00:00.000Z \(Gmail timestamp; sent Date header missing\)/);
     const saved = workflow.policyGet();
     await workflow.stop();
     workflow = createMailWorkflow({ config, stateDir: h.stateDir, ...provider, decisions, subagent });
     await workflow.start();
     assert.deepEqual(workflow.policyGet(), saved); assert.equal(requests.length, 3);
+  } finally { await workflow.stop(); }
+}));
+
+test('skipped backlog stays quiet across days and restarts, labels independently, and can be reconsidered by policy', async t => withHarness(async h => {
+  t.mock.timers.enable({ apis: ['Date'], now: new Date(2026, 9, 19, 12).getTime() });
+  h.setFixture({ ...fixture([message('aa01', 'Publication receipt', { received: Date.now() - 60000 })]), probeWritableDb: false });
+  let actions = 0, labels = 0, wakes = 0;
+  const requests: string[] = [];
+  const provider = assessments();
+  const decisions: DecisionRuntimeV1 = { evaluate: async (batch, opts) => {
+    requests.push(JSON.stringify(batch.questions));
+    const label = opts.purpose.endsWith('.labels');
+    if (label) labels++; else actions++;
+    const choice = label ? 'apply' : actions === 1 ? 'skip' : 'wake';
+    return { status: 'ok', provenance: { providerId: 'typesafe', rubricVersion: opts.rubricVersion, runtimeGeneration: 'test' },
+      result: { model: 'jev-1.13.0', answers: Object.fromEntries(Object.keys(batch.questions).map(key => [key, { type: 'choice', choice, probabilities: {} }])) } };
+  } };
+  const config = triageConfig(h.config, { policy: { ...defaultPolicy, labels: [{ name: 'Receipts', description: 'Publication receipts' }] } });
+  let workflow: ReturnType<typeof createMailWorkflow>;
+  const subagent: MailSubagent = {
+    run: async ({ sessionKey, message: prompt }) => {
+      wakes++;
+      const jobId = jobIdFromPrompt(prompt);
+      workflow.complete({ jobId, sessionKey, reason: 'Handled after policy change' });
+      return { runId: jobId, sessionKey };
+    }, waitForRun: async () => ({ status: 'ok' }),
+  };
+  workflow = createMailWorkflow({ config, stateDir: h.stateDir, ...provider, decisions, subagent });
+  try {
+    await workflow.start(); await waitFor(() => !workflow.status().triage!.labeling);
+    assert.deepEqual(workflow.status().messages, { skipped: 1 });
+    assert.deepEqual(workflow.inspect('aa01')[0].plan, { action: 'skip' });
+    assert.equal(actions, 1); assert.equal(labels, 1); assert.equal(wakes, 0);
+    assert.ok(requests.every(request => /Today's date: 2026-10-19 \([^)]+\)/.test(request)), 'action and independent labels both get the current date');
+    const mail = (await new GogMailClient(h.config).getThread('bb01')).messages[0];
+    assert.deepEqual(mail.labelIds.sort(), ['INBOX', 'Label_1']);
+    assert.equal(workflow.status().nextQueueWakeAt, null);
+    t.mock.timers.setTime(Date.now() + 2 * 86400000);
+    await workflow.poll(); await workflow.stop();
+    workflow = createMailWorkflow({ config, stateDir: h.stateDir, ...provider, decisions, subagent });
+    await workflow.start();
+    assert.equal(actions, 1); assert.equal(labels, 1); assert.equal(wakes, 0);
+    assert.deepEqual(workflow.status().jobs, {});
+    const current = workflow.policyGet();
+    workflow.policyUpdate({ ...current.document, prompt: 'Wake for publication receipts needing verification.' }, current.version, 'main');
+    await workflow.poll(); await waitFor(() => !workflow.status().working);
+    assert.equal(actions, 2); assert.equal(labels, 1); assert.equal(wakes, 1);
+    assert.match(requests.at(-1)!, /Today's date: 2026-10-21 \([^)]+\)/);
+    assert.deepEqual(workflow.status().messages, { done: 1 });
+    assert.ok(!h.calls().some(args => args.includes('send') || args.includes('TRASH') || args.includes('--remove')));
   } finally { await workflow.stop(); }
 }));
 
@@ -752,7 +806,7 @@ test('deferred daily queue resumes together at the explicit time after restart',
     t.mock.timers.setTime(Date.now() + 1000);
     await workflow.poll(); await waitFor(() => !workflow.status().working);
     assert.deepEqual(wakes, [['aa01', 'aa02'], ['aa01', 'aa02']], 'explicit defer must not wait for another daily queue interval');
-    assert.equal(provider.calls(), 2, 'unchanged mail reuses its successful decisions');
+    assert.equal(provider.calls(), 4, 'explicit deferral reassesses both messages with the new day, rather than reusing stale date context');
     assert.equal(workflow.status().messages.done, 2);
     assert.equal(workflow.status().activeJob, null);
     assert.equal(workflow.status().nextDeferredWakeAt, null);
@@ -982,13 +1036,15 @@ test('categorization cannot change mailbox folders but can apply non-folder syst
   } finally { await workflow.stop(); }
 }));
 
-test('date-range scans traverse all pages, delete matches only, and never queue, wake or label', async () => withHarness(async h => {
+test('date-range scans traverse all pages, delete matches only, and never queue, wake or label', async t => withHarness(async h => {
+  t.mock.timers.enable({ apis: ['Date'], now: new Date(2026, 9, 19, 12).getTime() });
   h.setFixture(fixture([]));
   const deletePrompt = 'Delete expired promotions only.';
   const provider = assessments(id => ({ action: { type: 'choice', choice: id === 'aa00' ? 'keep' : 'delete', probabilities: {} } }));
   const decisions: DecisionRuntimeV1 = { evaluate: async (batch, opts) => {
     assert.equal(opts.purpose, 'gog-email-watch.delete-scan');
     assert.ok(JSON.stringify(batch.questions).includes(deletePrompt));
+    assert.match(JSON.stringify(batch.questions), /Today's date: 2026-10-19 \([^)]+\)/);
     const question = batch.questions.action;
     assert.ok(question.type === 'choice');
     assert.deepEqual(Object.keys(question.criteria).sort(), ['delete', 'keep']);

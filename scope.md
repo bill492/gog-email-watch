@@ -8,7 +8,10 @@ and individual email addresses.
 
 Version 0.2 extends the port with the inbox-triage feature in issue #1. Preserve
 thread context and reply/skip handling when triage is omitted. When explicitly
-enabled, classify mail already present at first enablement as wake, queue or delete.
+enabled, classify mail already present at first enablement as wake, queue, skip or delete.
+Skip keeps mail untouched without a wake; independent labeling still applies.
+Every message carries its sent date (or a clearly identified Gmail timestamp
+fallback), and every Jev request includes the current date and Gateway timezone.
 Use one consolidated wake per processing cycle and an agent-configured queue
 interval. Independent label definitions (name + description) use a separate Jev
 request. Explicit date-range historical scans apply deletion only, never queue,

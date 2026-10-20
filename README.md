@@ -5,8 +5,8 @@ Gmail backlog triage and an approved-sender responder, using the node's existing
 
 ## Two separate paths
 
-- **Existing inbox mail:** optional Jev triage chooses **wake**, **queue**, or
-  **delete**. The cutoff is fixed when triage is first enabled; later arrivals do
+- **Existing inbox mail:** optional Jev triage chooses **wake**, **queue**, **skip**,
+  or **delete**. The cutoff is fixed when triage is first enabled; later arrivals do
   not enter this classifier.
 - **New mail:** the existing responder handles configured senders, with full
   conversation context and an in-thread reply/skip helper. Authentication,
@@ -27,7 +27,7 @@ no separate scheduler, provider transport or generic queue framework.
    cutoff (Unix milliseconds; `0` when triage has not been initialized).
 2. **New install?** Follow [Setup](#setup), then optionally enable
    [Backlog triage](#backlog-triage). Preserve unrelated OpenClaw configuration.
-3. **Choose the right control:** `policy.prompt` tells Jev when to wake or queue;
+3. **Choose the right control:** `policy.prompt` tells Jev when to wake, queue or skip;
    `policy.deletePrompt` defines deletions; `policy.labels` defines independent
    categorization. `settings.wakePrompt` and `settings.responderPrompt` instruct
    the agent after dispatch, not Jev.
@@ -128,7 +128,7 @@ Add `triage` to the plugin config:
     "decisionModel": "typesafe/jev-1.13.0",
     "concurrency": 50,
     "policy": {
-      "prompt": "Wake for requests needing my attention and human replies in conversations I participated in. Queue informational mail.",
+      "prompt": "Wake for current unresolved requests assigned to me that need attention now. Queue non-urgent mail worth my attention later. Skip completed, expired or informational mail that needs no attention. Consider later replies in the thread.",
       "deletePrompt": "Delete unsolicited sales pitches and expired promotions. Keep customer conversations and financial records.",
       "queueMinutes": 60,
       "labels": [
@@ -179,7 +179,7 @@ Before enabling backlog triage, use this read-only checklist:
 
 **Enabling triage starts processing the real existing Inbox on the next service
 start.** The example above enables real Trash writes for matching mail. Use an
-empty `deletePrompt` if you want wake/queue/labels without automatic deletion.
+empty `deletePrompt` if you want wake/queue/skip/labels without automatic deletion.
 
 ### Triage and policy options
 
@@ -195,14 +195,14 @@ Policy paths below are relative to `triage.policy` in the file, or `policy` in
 
 | Field | Type / default | Purpose |
 | --- | --- | --- |
-| `prompt` | String; default text below | Instructions for Jev's wake/queue/delete decision. |
+| `prompt` | String; default text below | Instructions for Jev's wake/queue/skip/delete decision. |
 | `deletePrompt` | String; `""` | Additional deletion criteria, used in routine triage and historical scans. Empty or whitespace-only disables deletion. |
 | `queueMinutes` | Number > 0; `1440` (24 hours) | Wake interval for queued mail. Fractions are allowed; `0` and `null` are not disable switches. |
 | `labels` | Array; `[]` | Each item requires a nonempty string `name` and a string `description`. The name is the actual Gmail label; the description tells Jev when it applies. Empty array disables new categorization requests. |
 
 The default `prompt` is:
 
-> Wake for actionable requests or human replies in conversations this account has participated in. Queue other mail. Use delete only for mail matching the deletion instructions.
+> Wake for current, unresolved requests or actions owned by this account that need attention now. Consider later replies, completed work and expired deadlines; a human reply alone does not require a wake. Queue non-urgent mail worth attention at the next scheduled wake. Skip resolved, expired or informational mail that needs no attention. Use delete only for mail matching the deletion instructions.
 
 ### Actions and wakes
 
@@ -213,6 +213,11 @@ The default `prompt` is:
   never wake. The first queue waits from its oldest item's discovery; subsequent
   deliveries respect the prior queue wake. The poll interval and an already
   running agent job can delay delivery.
+- **skip:** keep the message untouched without creating a job or waking the agent.
+  Independent labels can still apply. The result persists across polls and restarts;
+  explicit classification-policy or evidence changes can reconsider skipped mail.
+  This is Jev's classification, distinct from `gog_email_skip`, which finishes an
+  agent job that has already been dispatched.
 - **delete:** move the matched **message** to Gmail Trash, removing INBOX.
   No archive action, forced review, quarantine, protected-category veto, or
   confidence threshold. No permanent-delete or purge endpoint; Gmail's normal
@@ -230,19 +235,26 @@ mail must still be in Inbox; historical scans may also delete archived mail.
 Classification failures remain pending and retry on later polls;
 there is no attempt ceiling, daily inference allowance or plugin dollar cap.
 
-Polling and the queue wake interval do not reclassify successfully queued mail.
+Polling and the queue wake interval do not reclassify successfully queued or skipped mail.
 An unchanged email normally needs one action request, plus one independent label
 request if labels are configured (all label definitions share that request).
 For example, two-minute polls do not generate a Jev request every two minutes.
 Setting `queueMinutes` to 2 delivers queued mail in a consolidated agent wake when
 due; it does not ask Jev to choose again. Failed requests retry, and prompt changes
-can reclassify undispatched work. Successful identical assessments are cached.
+can reclassify undispatched work, including skipped mail. Successful identical
+assessments are cached with the current date: an explicit reassessment on a later
+day (for example, a deferred job or repeated deletion scan) uses that day's context.
+The date changing alone does not schedule another classification.
+
+Existing custom prompts are preserved. If yours says "Queue other mail", edit it
+to distinguish non-urgent attention from mail needing no attention; otherwise it
+will still encourage unnecessary queue wakes despite the available `skip` choice.
 
 ### Independent labels
 
 Each label has its actual Gmail `name` and a categorization `description`.
 Jev receives these in a **separate request** from the action decision, returning
-apply/skip per label. Multiple labels can apply to a wake or queue item.
+apply/skip per label. Multiple labels can apply to a wake, queue or skipped item.
 
 Label inference and Gmail writes are asynchronous relative to wake dispatch.
 A slow or failed label request does not change the action or block waking.
@@ -288,7 +300,7 @@ For example, to replace the policy with hourly queue wakes and one category:
 {
   "expectedVersion": 1,
   "policy": {
-    "prompt": "Wake for time-sensitive requests and replies requiring my action. Queue informational mail.",
+    "prompt": "Wake for current time-sensitive requests requiring my action. Queue non-urgent items worth attention later. Skip resolved, expired and routine informational mail. Consider later replies in the thread.",
     "deletePrompt": "",
     "queueMinutes": 60,
     "labels": [
@@ -318,7 +330,7 @@ Account, sender lists, aliases, agent routing, executable path, triage enablemen
 decision-model selection and the external-reply toggle remain file configuration.
 Live tools do not edit them. Preserve the state directory when upgrading.
 
-Classification-prompt or evidence edits reclassify work not yet dispatched; label
+Classification-prompt or evidence edits reclassify work not yet dispatched, including skipped mail; label
 edits refresh labeling independently. Queue timing, wake/responder snippets,
 concurrency and transport edits do not reclassify mail or invalidate compatible
 in-flight assessments. Completed agent jobs and sends are never replayed.
@@ -466,7 +478,13 @@ scan replay is added.
 Jev sees trimmed plaintext, preferring the MIME plaintext alternative and converting
 HTML only when necessary. The target comes first, followed by recent thread context.
 By default, the first **16,000 JSON-encoded UTF-8 bytes** of evidence are sent to fit the Jev
-integration that rejected larger inputs. Headers are basic From/To/Cc/Subject/Date;
+integration that rejected larger inputs. Each message starts with its sent date
+(the sender-provided `Date` header, retaining its timezone). If missing, Gmail's
+timestamp is included with an explicit fallback note; it is not presented as a
+verified send time. Full conversation files use the same date representation.
+Every Jev action, deletion-scan and label prompt includes today's date and the
+Gateway process's timezone, calculated when the request is prepared rather than
+hard-coded at installation. Other headers are basic From/To/Cc/Subject;
 raw HTML, transport headers and attachment binaries are not sent. Coverage reports
 truncation/missing content, but does not force review or veto deletion.
 
@@ -481,7 +499,7 @@ The original responder still runs one agent job at a time. The default agent-run
 wait is 11 minutes; the default CLI wait for a historical scan response is 30 minutes;
 timing out is not proof the scan stopped. Agent-run and send
 receipts protect against duplicate external actions; uncertain execution is an
-operational error, not a fourth Jev classification. Existing reply history is retained.
+operational error, not a Jev classification. Existing reply history is retained.
 Host-queued (`pending`) agent runs stay active and are observed until completion
 or the configured wait deadline; waiting never redispatches the run.
 
@@ -506,13 +524,14 @@ ownership check or forced 0600/0700 mode.
 - **No wake:** check `gog_email_status` and `gog_email_inspect`. New arrivals
   are not backlog mail; queued mail waits for its interval; a running agent job
   delays dispatch. Failed classification remains pending for retry rather than
-  becoming a queue decision. Polling queued mail does not reclassify it.
+  becoming a queue decision. Skipped mail never wakes; polling queued or skipped
+  mail does not reclassify it.
 - **Label failure:** inspect the separate label error. Check Gmail's label rules
   or Jev's error; action/wake processing continues independently.
 - **Interrupted/uncertain execution:** inspect `unresolvedJobs` in status, then
   use `gog_email_inspect` with `jobId` to reconcile the actual agent/send outcome
   before `gog_email_resolve`. A stored
-  `needs_review` execution status is not a fourth Jev action or deletion-review mode.
+  `needs_review` execution status is not a Jev action or deletion-review mode.
 - **Historical CLI timeout:** the scan may still be running. Check `scan` in
   `gog_email_status`; retrieve saved outcomes with `gog_email_inspect({"scan":true})`
   before retrying. Increase `--timeout` for a longer client wait; it does

@@ -1,4 +1,4 @@
-import { bodyText, type GmailPart, type GmailThread } from "./mail.js";
+import { bodyText, sentDate, type GmailPart, type GmailThread } from "./mail.js";
 import { defaultSettings, hash, type RuntimeSettings } from "./policy.js";
 
 // Bound JSON-encoded UTF-8 bytes (including escaping), without splitting codepoints.
@@ -30,8 +30,8 @@ export function evidence(thread: GmailThread, targetId?: string, settings: Runti
     scan(message.payload);
     const body = bodyText(message.payload).trim();
     if (!body) missing.add("missing inline body");
-    const headers = (message.payload.headers ?? []).filter(header => ["from", "to", "cc", "subject", "date"].includes(header.name.toLowerCase()));
-    return [`Message ID: ${message.id}`, ...headers.map(header => `${header.name}: ${header.value}`), "", body].join("\n");
+    const headers = (message.payload.headers ?? []).filter(header => ["from", "to", "cc", "subject"].includes(header.name.toLowerCase()));
+    return [`Sent date: ${sentDate(message)}`, `Message ID: ${message.id}`, ...headers.map(header => `${header.name}: ${header.value}`), "", body].join("\n");
   }).join("\n\n---\n\n");
   const content = { format: 2, threadId: thread.id, text: "", truncated: false };
   const available = settings.maxBytes - Buffer.byteLength(JSON.stringify(content));

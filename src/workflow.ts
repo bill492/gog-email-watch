@@ -216,7 +216,7 @@ export function createMailWorkflow(options: WorkflowOptions) {
                 // Explicit deferral schedules this job's next wake, not another
                 // ordinary queue interval. Keep the intent through retries/restarts.
                 const deferredWake = row.job_id && state.job(row.job_id)?.status === "deferred";
-                status = result.action === "wake" || deferredWake ? "wake" : "queue";
+                status = result.action === "skip" ? "skipped" : result.action === "wake" || deferredWake ? "wake" : "queue";
                 const folder = join(stateDir, "triage");
                 mkdirSync(folder, { recursive: true });
                 writeFileSync(join(folder, `${row.id}.md`), renderThread(thread));
